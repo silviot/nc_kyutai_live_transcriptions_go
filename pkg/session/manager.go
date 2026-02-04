@@ -1,0 +1,397 @@
+package session
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/silviot/nc_kyutai_live_transcriptions_go/pkg/audio"
+	"github.com/silviot/nc_kyutai_live_transcriptions_go/pkg/hpb"
+	"github.com/silviot/nc_kyutai_live_transcriptions_go/pkg/modal"
+	"github.com/silviot/nc_kyutai_live_transcriptions_go/pkg/webrtc"
+)
+
+// Speaker represents an active speaker in a room
+type Speaker struct {
+	SessionID   string
+	UserID      string
+	Name        string
+	Transcriber *Transcriber
+}
+
+// Transcriber manages transcription for a single speaker
+type Transcriber struct {
+	sessionID   string
+	peerConn    *webrtc.PeerConnection
+	audioCache  *audio.ChunkBuffer
+	modalClient *modal.Client
+	audioPipe   *audio.Pipeline
+	mu          sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+}
+
+// Room manages transcription for a single Nextcloud Talk room
+type Room struct {
+	RoomToken    string
+	LanguageID   string
+	HPBClient    *hpb.Client
+	WebRTCMgr    *webrtc.Manager
+	Speakers     map[string]*Speaker  // sessionID -> Speaker
+	ModalClients map[string]*modal.Client // sessionID -> Modal client
+	mu           sync.RWMutex
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	logger       *slog.Logger
+}
+
+// Manager manages multiple rooms
+type Manager struct {
+	rooms        map[string]*Room  // roomToken -> Room
+	mu           sync.RWMutex
+	logger       *slog.Logger
+	hpbURL       string
+	hpbSecret    string
+	modalConfig  modal.Config
+	maxSpeakers  int
+}
+
+// ManagerConfig holds configuration for the session manager
+type ManagerConfig struct {
+	HPBURL          string
+	HPBSecret       string
+	ModalWorkspace  string
+	ModalKey        string
+	ModalSecret     string
+	MaxSpeakers     int
+	Logger          *slog.Logger
+}
+
+// NewManager creates a new session manager
+func NewManager(cfg ManagerConfig) *Manager {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+
+	if cfg.MaxSpeakers <= 0 {
+		cfg.MaxSpeakers = 500
+	}
+
+	return &Manager{
+		rooms:       make(map[string]*Room),
+		logger:      cfg.Logger,
+		hpbURL:      cfg.HPBURL,
+		hpbSecret:   cfg.HPBSecret,
+		maxSpeakers: cfg.MaxSpeakers,
+		modalConfig: modal.Config{
+			Workspace: cfg.ModalWorkspace,
+			Key:       cfg.ModalKey,
+			Secret:    cfg.ModalSecret,
+			Logger:    cfg.Logger,
+		},
+	}
+}
+
+// JoinRoom starts transcription for a room
+func (m *Manager) JoinRoom(ctx context.Context, roomToken, languageID string, turnServers []webrtc.TURNServer) (*Room, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check if room already exists
+	if room, exists := m.rooms[roomToken]; exists {
+		m.logger.Info("room already joined", "roomToken", roomToken)
+		return room, nil
+	}
+
+	// Create HPB client
+	hpbClient := hpb.NewClient(hpb.Config{
+		HPBURL: m.hpbURL,
+		Secret: m.hpbSecret,
+		Logger: m.logger,
+	})
+
+	if err := hpbClient.Connect(ctx); err != nil {
+		return nil, fmt.Errorf("failed to connect to HPB: %w", err)
+	}
+
+	// Join the room
+	if err := hpbClient.JoinRoom(roomToken); err != nil {
+		hpbClient.Close()
+		return nil, fmt.Errorf("failed to join room: %w", err)
+	}
+
+	// Create WebRTC manager
+	rtcConfig := webrtc.ConnectionConfig{
+		STUN: []string{
+			"stun:stun.l.google.com:19302",
+			"stun:stun1.l.google.com:19302",
+		},
+		TURN: turnServers,
+	}
+
+	webrtcMgr, err := webrtc.NewManager(rtcConfig, m.logger)
+	if err != nil {
+		hpbClient.Close()
+		return nil, fmt.Errorf("failed to create WebRTC manager: %w", err)
+	}
+
+	// Create room context
+	roomCtx, cancel := context.WithCancel(context.Background())
+
+	room := &Room{
+		RoomToken:    roomToken,
+		LanguageID:   languageID,
+		HPBClient:    hpbClient,
+		WebRTCMgr:    webrtcMgr,
+		Speakers:     make(map[string]*Speaker),
+		ModalClients: make(map[string]*modal.Client),
+		ctx:          roomCtx,
+		cancel:       cancel,
+		logger:       m.logger,
+	}
+
+	m.rooms[roomToken] = room
+
+	// Start room orchestration loop
+	room.wg.Add(1)
+	go room.orchestrationLoop()
+
+	m.logger.Info("room joined", "roomToken", roomToken, "languageID", languageID)
+
+	return room, nil
+}
+
+// orchestrationLoop manages room-level coordination
+func (r *Room) orchestrationLoop() {
+	defer r.wg.Done()
+
+	hpbMsgCh := r.HPBClient.MessageChan()
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case msg := <-hpbMsgCh:
+			r.handleHPBMessage(msg)
+		}
+	}
+}
+
+// handleHPBMessage routes HPB messages appropriately
+func (r *Room) handleHPBMessage(msg interface{}) {
+	switch m := msg.(type) {
+	case *hpb.RoomMessage:
+		r.handleRoomMessage(m)
+	case *hpb.MessageMessage:
+		r.handleSignalingMessage(m)
+	case *hpb.ByeMessage:
+		r.handleByeMessage(m)
+	default:
+		r.logger.Debug("unhandled HPB message type", "type", fmt.Sprintf("%T", msg))
+	}
+}
+
+// handleRoomMessage processes room topology updates
+func (r *Room) handleRoomMessage(msg *hpb.RoomMessage) {
+	r.logger.Debug("room message received", "participants", len(msg.Participants))
+
+	// Process participants
+	for _, participant := range msg.Participants {
+		if participant.Audio && participant.InCall {
+			r.addSpeaker(participant.SessionID, participant.UserID, participant.Name)
+		}
+	}
+}
+
+// handleSignalingMessage processes WebRTC signaling (offers/answers/ICE)
+func (r *Room) handleSignalingMessage(msg *hpb.MessageMessage) {
+	// Extract SDP offer/answer from message data
+	// This requires parsing the Janus signaling format
+	r.logger.Debug("signaling message", "from", msg.From, "data_type", fmt.Sprintf("%T", msg.Data))
+
+	// TODO: Parse SDP and route to appropriate peer connection
+}
+
+// handleByeMessage processes departure notifications
+func (r *Room) handleByeMessage(msg *hpb.ByeMessage) {
+	r.logger.Info("participant leaving", "sessionID", msg.SessionID)
+
+	// Remove speaker and clean up resources
+	r.removeSpeaker(msg.SessionID)
+}
+
+// addSpeaker adds a new speaker to the room
+func (r *Room) addSpeaker(sessionID, userID, name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Check if already exists
+	if _, exists := r.Speakers[sessionID]; exists {
+		return nil
+	}
+
+	// Check capacity
+	if len(r.Speakers) >= 100 { // Reasonable limit per room
+		r.logger.Warn("speaker capacity reached for room", "roomToken", r.RoomToken)
+		return fmt.Errorf("room at capacity")
+	}
+
+	// Create WebRTC peer connection
+	peerConn, err := r.WebRTCMgr.CreatePeer(r.ctx, sessionID)
+	if err != nil {
+		r.logger.Error("failed to create peer connection", "sessionID", sessionID, "error", err)
+		return err
+	}
+
+	// Create Modal client
+	modalClient := modal.NewClient(modal.Config{
+		Workspace: "", // Set from manager config
+		Key:       "", // Set from manager config
+		Secret:    "", // Set from manager config
+		Logger:    r.logger,
+	})
+
+	// TODO: Connect Modal client
+
+	// Create speaker record
+	speaker := &Speaker{
+		SessionID: sessionID,
+		UserID:    userID,
+		Name:      name,
+		Transcriber: &Transcriber{
+			sessionID:   sessionID,
+			peerConn:    peerConn,
+			audioCache:  audio.NewChunkBuffer(24000, 200, r.logger),
+			modalClient: modalClient,
+		},
+	}
+
+	r.Speakers[sessionID] = speaker
+	r.ModalClients[sessionID] = modalClient
+
+	r.logger.Info("speaker added", "sessionID", sessionID, "name", name, "roomToken", r.RoomToken)
+
+	return nil
+}
+
+// removeSpeaker removes a speaker from the room
+func (r *Room) removeSpeaker(sessionID string) error {
+	r.mu.Lock()
+	speaker, exists := r.Speakers[sessionID]
+	if !exists {
+		r.mu.Unlock()
+		return fmt.Errorf("speaker not found: %s", sessionID)
+	}
+	delete(r.Speakers, sessionID)
+
+	// Close Modal client
+	if modalClient, ok := r.ModalClients[sessionID]; ok {
+		modalClient.Close()
+		delete(r.ModalClients, sessionID)
+	}
+	r.mu.Unlock()
+
+	// Close WebRTC peer
+	if err := r.WebRTCMgr.RemovePeer(sessionID); err != nil {
+		r.logger.Error("failed to remove peer", "sessionID", sessionID, "error", err)
+	}
+
+	r.logger.Info("speaker removed", "sessionID", sessionID, "name", speaker.Name)
+
+	return nil
+}
+
+// LeaveRoom closes the room and all active transcriptions
+func (m *Manager) LeaveRoom(roomToken string) error {
+	m.mu.Lock()
+	room, exists := m.rooms[roomToken]
+	if !exists {
+		m.mu.Unlock()
+		return fmt.Errorf("room not found: %s", roomToken)
+	}
+	delete(m.rooms, roomToken)
+	m.mu.Unlock()
+
+	// Cancel room context (stops orchestration loop)
+	room.cancel()
+
+	// Close all speakers
+	room.mu.Lock()
+	for sessionID := range room.Speakers {
+		if err := room.removeSpeaker(sessionID); err != nil {
+			room.logger.Error("failed to remove speaker", "sessionID", sessionID, "error", err)
+		}
+	}
+	room.mu.Unlock()
+
+	// Close WebRTC manager
+	if err := room.WebRTCMgr.Close(); err != nil {
+		room.logger.Error("failed to close WebRTC manager", "error", err)
+	}
+
+	// Close HPB client
+	if err := room.HPBClient.Close(); err != nil {
+		room.logger.Error("failed to close HPB client", "error", err)
+	}
+
+	// Wait for all goroutines
+	done := make(chan struct{})
+	go func() {
+		room.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		m.logger.Warn("room cleanup timeout", "roomToken", roomToken)
+	}
+
+	m.logger.Info("room left", "roomToken", roomToken)
+
+	return nil
+}
+
+// RoomCount returns the number of active rooms
+func (m *Manager) RoomCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.rooms)
+}
+
+// SpeakerCount returns the total number of active speakers across all rooms
+func (m *Manager) SpeakerCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	count := 0
+	for _, room := range m.rooms {
+		room.mu.RLock()
+		count += len(room.Speakers)
+		room.mu.RUnlock()
+	}
+
+	return count
+}
+
+// Close shuts down all rooms and the manager
+func (m *Manager) Close() error {
+	m.mu.Lock()
+	roomTokens := make([]string, 0, len(m.rooms))
+	for token := range m.rooms {
+		roomTokens = append(roomTokens, token)
+	}
+	m.mu.Unlock()
+
+	for _, token := range roomTokens {
+		if err := m.LeaveRoom(token); err != nil {
+			m.logger.Error("failed to leave room during shutdown", "roomToken", token, "error", err)
+		}
+	}
+
+	return nil
+}
