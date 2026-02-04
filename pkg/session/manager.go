@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -209,11 +210,91 @@ func (r *Room) handleRoomMessage(msg *hpb.RoomMessage) {
 
 // handleSignalingMessage processes WebRTC signaling (offers/answers/ICE)
 func (r *Room) handleSignalingMessage(msg *hpb.MessageMessage) {
-	// Extract SDP offer/answer from message data
-	// This requires parsing the Janus signaling format
-	r.logger.Debug("signaling message", "from", msg.From, "data_type", fmt.Sprintf("%T", msg.Data))
+	// Extract SDP offer from message data (Janus format)
+	if msg.Data == nil {
+		return
+	}
 
-	// TODO: Parse SDP and route to appropriate peer connection
+	// Convert data to map[string]interface{}
+	dataJSON, err := json.Marshal(msg.Data)
+	if err != nil {
+		r.logger.Debug("failed to marshal message data", "from", msg.From, "error", err)
+		return
+	}
+
+	var dataMap map[string]interface{}
+	if err := json.Unmarshal(dataJSON, &dataMap); err != nil {
+		r.logger.Debug("failed to unmarshal message data", "from", msg.From, "error", err)
+		return
+	}
+
+	// Handle offer
+	if offer, exists := dataMap["offer"]; exists {
+		offerStr, ok := offer.(map[string]interface{})
+		if !ok {
+			return
+		}
+
+		sdp, ok := offerStr["sdp"].(string)
+		if !ok {
+			return
+		}
+
+		sessionID := msg.From
+		r.handleOffer(sessionID, sdp)
+	}
+
+	// Handle ICE candidates
+	if candidate, exists := dataMap["candidate"]; exists {
+		sessionID := msg.From
+		candStr, _ := json.Marshal(candidate)
+		r.handleICECandidate(sessionID, string(candStr))
+	}
+}
+
+// handleOffer creates an answer for the SDP offer
+func (r *Room) handleOffer(sessionID, offerSDP string) {
+	peer := r.WebRTCMgr.GetPeer(sessionID)
+	if peer == nil {
+		r.logger.Warn("peer not found for offer", "sessionID", sessionID)
+		return
+	}
+
+	// Create answer
+	answerSDP, err := peer.CreateAnswer(offerSDP)
+	if err != nil {
+		r.logger.Error("failed to create answer", "sessionID", sessionID, "error", err)
+		return
+	}
+
+	// Send answer back via HPB
+	answerMsg := hpb.MessageMessage{
+		Type:      "message",
+		To:        sessionID,
+		RoomToken: r.RoomToken,
+		Data: map[string]interface{}{
+			"answer": map[string]interface{}{
+				"type": "answer",
+				"sdp":  answerSDP,
+			},
+		},
+	}
+
+	if err := r.HPBClient.SendMessage(answerMsg); err != nil {
+		r.logger.Error("failed to send answer", "sessionID", sessionID, "error", err)
+	}
+}
+
+// handleICECandidate adds an ICE candidate to the peer connection
+func (r *Room) handleICECandidate(sessionID, candidate string) {
+	peer := r.WebRTCMgr.GetPeer(sessionID)
+	if peer == nil {
+		return
+	}
+
+	if err := peer.AddICECandidate(candidate); err != nil {
+		r.logger.Debug("failed to add ICE candidate", "sessionID", sessionID, "error", err)
+	}
 }
 
 // handleByeMessage processes departure notifications
@@ -257,21 +338,38 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 
 	// TODO: Connect Modal client
 
+	// Create audio pipeline
+	audioPipe, err := audio.NewPipeline(48000, 24000, r.logger)
+	if err != nil {
+		r.logger.Error("failed to create audio pipeline", "sessionID", sessionID, "error", err)
+		r.WebRTCMgr.RemovePeer(sessionID)
+		modalClient.Close()
+		return err
+	}
+
+	transcriber := &Transcriber{
+		sessionID:   sessionID,
+		peerConn:    peerConn,
+		audioCache:  audio.NewChunkBuffer(24000, 200, r.logger),
+		modalClient: modalClient,
+		audioPipe:   audioPipe,
+	}
+
 	// Create speaker record
 	speaker := &Speaker{
-		SessionID: sessionID,
-		UserID:    userID,
-		Name:      name,
-		Transcriber: &Transcriber{
-			sessionID:   sessionID,
-			peerConn:    peerConn,
-			audioCache:  audio.NewChunkBuffer(24000, 200, r.logger),
-			modalClient: modalClient,
-		},
+		SessionID:   sessionID,
+		UserID:      userID,
+		Name:        name,
+		Transcriber: transcriber,
 	}
 
 	r.Speakers[sessionID] = speaker
 	r.ModalClients[sessionID] = modalClient
+
+	// Start transcriber goroutine
+	transcriber.ctx, transcriber.cancel = context.WithCancel(r.ctx)
+	transcriber.wg.Add(1)
+	go transcriber.run(r.HPBClient, r.RoomToken, r.logger)
 
 	r.logger.Info("speaker added", "sessionID", sessionID, "name", name, "roomToken", r.RoomToken)
 

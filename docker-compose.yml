@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  transcribe-service:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # Required - set these to your actual values
+      LT_HPB_URL: ${LT_HPB_URL:-wss://hpb.example.com}
+      LT_INTERNAL_SECRET: ${LT_INTERNAL_SECRET:-your-secret}
+      MODAL_WORKSPACE: ${MODAL_WORKSPACE:-your-workspace}
+      MODAL_KEY: ${MODAL_KEY:-your-key}
+      MODAL_SECRET: ${MODAL_SECRET:-your-secret}
+
+      # Optional
+      PORT: 8080
+      LOG_LEVEL: info
+
+    # Restart policy for production
+    restart: unless-stopped
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M

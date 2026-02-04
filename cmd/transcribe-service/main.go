@@ -85,13 +85,9 @@ func main() {
 			sessionMgr.RoomCount(), sessionMgr.SpeakerCount(), time.Now().Unix())
 	})
 
-	// Transcription endpoint (placeholder)
-	mux.HandleFunc("POST /api/v1/call/transcribe", func(w http.ResponseWriter, r *http.Request) {
-		// TODO: Implement transcription request handling
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotImplemented)
-		fmt.Fprintf(w, `{"error":"not yet implemented"}\n`)
-	})
+	// Transcription endpoints
+	mux.HandleFunc("POST /api/v1/call/transcribe", sessionMgr.HandleTranscribeRequest)
+	mux.HandleFunc("DELETE /api/v1/call/transcribe/{roomToken}", sessionMgr.HandleStopTranscriptionRequest)
 
 	// Metrics endpoint (placeholder)
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
