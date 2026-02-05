@@ -274,22 +274,31 @@ Orchestrator
 ## Open Questions
 
 1. **Resampling library choice:** Pure Go vs libsoxr (cgo)?
-   - Decide based on CPU benchmark (target: <10% CPU per speaker)
-   - MVP: Pure Go; optimize if needed
+   - **Decision:** Pure Go linear interpolation (implemented)
+   - Simpler deployment, no cgo dependencies
+   - Benchmark against Python baseline in live testing
+   - If quality issues: consider libsoxr via cgo
 
 2. **Modal cold start timeout calibration:** Is 120s sufficient?
-   - Validate with actual Modal workspace
+   - **Status:** Implemented with 120s timeout
+   - Validate with actual Modal workspace during live testing
    - Document in Kyutai integration runbook
 
 3. **HPB reconnection backoff tuning:** Exponential (base=2, max 5) appropriate?
-   - Monitor reconnection frequency in staging
+   - **Status:** Implemented as designed
+   - Monitor reconnection frequency during live testing
    - Adjust if too aggressive or passive
 
 4. **Bounded channel sizes:** Are proposed sizes (100, 10, 50) correct?
-   - Validate under load (100+ concurrent speakers)
+   - **Status:** Implemented:
+     - Audio input: 100 frames (~2s buffer)
+     - Audio output: 10 chunks (200ms each = 2s buffer)
+     - Modal reconnection: 5 attempts
+   - Validate under load during live testing
    - Monitor channel fullness in production metrics
 
 5. **API contract completeness:** Any undocumented Python behaviors needed?
-   - Audit Python fastapi endpoints vs Go implementation
-   - Test with actual Nextcloud Talk instance
+   - **Status:** Basic endpoints implemented (POST /transcribe, GET /healthz)
+   - Test with actual Nextcloud Talk instance: https://cloud.codemyriad.io
+   - Compare behavior with Python roundtrip_modal.py script
 
