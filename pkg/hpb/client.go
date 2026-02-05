@@ -196,12 +196,16 @@ func (c *Client) sendPing() error {
 
 // handleMessage routes incoming messages to appropriate handlers
 func (c *Client) handleMessage(data []byte) error {
-	// Remove HMAC signature (format: "sig data")
-	parts := strings.SplitN(string(data), " ", 2)
-	if len(parts) < 2 {
-		return fmt.Errorf("invalid message format: missing HMAC")
+	// HPB sends plain JSON (no HMAC signature on incoming messages)
+	// Try to detect if message has HMAC prefix (for mock servers)
+	msgData := data
+	if len(data) > 0 && data[0] != '{' && data[0] != '[' {
+		// Might be HMAC-signed (format: "sig json"), try to extract JSON
+		parts := strings.SplitN(string(data), " ", 2)
+		if len(parts) >= 2 {
+			msgData = []byte(parts[1])
+		}
 	}
-	msgData := []byte(parts[1])
 
 	// Parse message type
 	var baseMsg Message
