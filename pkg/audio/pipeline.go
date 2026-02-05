@@ -141,6 +141,25 @@ func (p *Pipeline) OutputChan() <-chan []float32 {
 	return p.outputFrameCh
 }
 
+// ProcessFrame resamples a float32 audio frame (public API for direct processing)
+func (p *Pipeline) ProcessFrame(frame []float32) ([]float32, error) {
+	if len(frame) == 0 {
+		return []float32{}, nil
+	}
+
+	// Resample if needed
+	if p.inputSampleRate == p.outputSampleRate {
+		return frame, nil
+	}
+
+	resampled, err := p.resampler.Resample(frame)
+	if err != nil {
+		return nil, fmt.Errorf("resampling failed: %w", err)
+	}
+
+	return resampled, nil
+}
+
 // Close closes the pipeline and cleans up
 func (p *Pipeline) Close() error {
 	close(p.closeCh)

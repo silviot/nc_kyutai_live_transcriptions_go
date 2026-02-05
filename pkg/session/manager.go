@@ -24,15 +24,17 @@ type Speaker struct {
 
 // Transcriber manages transcription for a single speaker
 type Transcriber struct {
-	sessionID   string
-	peerConn    *webrtc.PeerConnection
-	audioCache  *audio.ChunkBuffer
-	modalClient *modal.Client
-	audioPipe   *audio.Pipeline
-	mu          sync.Mutex
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	sessionID    string
+	peerConn     *webrtc.PeerConnection
+	audioCache   *audio.ChunkBuffer
+	modalClient  *modal.Client
+	audioPipe    *audio.Pipeline
+	audioInputCh chan []int16   // Raw audio frames from WebRTC
+	audioOutCh   chan []float32 // Processed audio chunks for Modal
+	mu           sync.Mutex
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
 }
 
 // Room manages transcription for a single Nextcloud Talk room
@@ -43,6 +45,7 @@ type Room struct {
 	WebRTCMgr    *webrtc.Manager
 	Speakers     map[string]*Speaker  // sessionID -> Speaker
 	ModalClients map[string]*modal.Client // sessionID -> Modal client
+	modalConfig  modal.Config // Modal client configuration
 	mu           sync.RWMutex
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -150,6 +153,7 @@ func (m *Manager) JoinRoom(ctx context.Context, roomToken, languageID string, tu
 		WebRTCMgr:    webrtcMgr,
 		Speakers:     make(map[string]*Speaker),
 		ModalClients: make(map[string]*modal.Client),
+		modalConfig:  m.modalConfig,
 		ctx:          roomCtx,
 		cancel:       cancel,
 		logger:       m.logger,
@@ -328,15 +332,13 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 		return err
 	}
 
-	// Create Modal client
+	// Create Modal client with proper configuration
 	modalClient := modal.NewClient(modal.Config{
-		Workspace: "", // Set from manager config
-		Key:       "", // Set from manager config
-		Secret:    "", // Set from manager config
+		Workspace: r.modalConfig.Workspace,
+		Key:       r.modalConfig.Key,
+		Secret:    r.modalConfig.Secret,
 		Logger:    r.logger,
 	})
-
-	// TODO: Connect Modal client
 
 	// Create audio pipeline
 	audioPipe, err := audio.NewPipeline(48000, 24000, r.logger)
@@ -348,11 +350,13 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 	}
 
 	transcriber := &Transcriber{
-		sessionID:   sessionID,
-		peerConn:    peerConn,
-		audioCache:  audio.NewChunkBuffer(24000, 200, r.logger),
-		modalClient: modalClient,
-		audioPipe:   audioPipe,
+		sessionID:    sessionID,
+		peerConn:     peerConn,
+		audioCache:   audio.NewChunkBuffer(24000, 200, r.logger),
+		modalClient:  modalClient,
+		audioPipe:    audioPipe,
+		audioInputCh: make(chan []int16, 100),   // Bounded: ~2s of audio frames
+		audioOutCh:   make(chan []float32, 10),  // Bounded: 10 chunks of 200ms
 	}
 
 	// Create speaker record
