@@ -2,16 +2,10 @@ package hpb
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/json"
-	"fmt"
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
 )
-
 
 func TestClientConnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -34,38 +28,42 @@ func TestClientConnect(t *testing.T) {
 }
 
 func TestHMACSignature(t *testing.T) {
-	cfg := Config{
-		HPBURL: "ws://127.0.0.1:9999",
-		Secret: "test-secret",
-		Logger: slog.Default(),
+	// Test the hmacSHA256 function
+	secret := "test-secret"
+	nonce := "test-nonce-12345"
+
+	sig := hmacSHA256(secret, nonce)
+
+	// Verify it's a valid hex string (64 chars for SHA256)
+	if len(sig) != 64 {
+		t.Errorf("expected 64 char hex signature, got %d chars", len(sig))
 	}
 
-	client := NewClient(cfg)
-
-	msg := HelloMessage{
-		Type:     "hello",
-		ResumeID: "test-id",
-	}
-	data, _ := json.Marshal(msg)
-
-	signed := client.addHMACSignature(data)
-
-	// Parse signature
-	parts := strings.SplitN(string(signed), " ", 2)
-	if len(parts) != 2 {
-		t.Fatalf("invalid signed message format")
+	// Verify deterministic output
+	sig2 := hmacSHA256(secret, nonce)
+	if sig != sig2 {
+		t.Errorf("HMAC should be deterministic: %s != %s", sig, sig2)
 	}
 
-	sig := parts[0]
-	msgPart := []byte(parts[1])
+	// Verify different inputs produce different signatures
+	sig3 := hmacSHA256(secret, "different-nonce")
+	if sig == sig3 {
+		t.Errorf("different inputs should produce different signatures")
+	}
+}
 
-	// Verify signature
-	expectedH := hmac.New(sha256.New, []byte("test-secret"))
-	expectedH.Write(msgPart)
-	expectedSig := fmt.Sprintf("%x", expectedH.Sum(nil))
+func TestGenerateNonce(t *testing.T) {
+	nonce1 := generateNonce()
+	nonce2 := generateNonce()
 
-	if sig != expectedSig {
-		t.Errorf("signature mismatch: got %s, want %s", sig, expectedSig)
+	// Should be 64 chars (32 bytes hex encoded)
+	if len(nonce1) != 64 {
+		t.Errorf("expected 64 char nonce, got %d chars", len(nonce1))
+	}
+
+	// Should be unique
+	if nonce1 == nonce2 {
+		t.Error("nonces should be unique")
 	}
 }
 
@@ -117,5 +115,37 @@ func TestIsConnected(t *testing.T) {
 	// Should not be connected initially
 	if client.IsConnected() {
 		t.Error("expected disconnected state initially")
+	}
+}
+
+func TestBackendURLDerivation(t *testing.T) {
+	tests := []struct {
+		hpbURL      string
+		expectedURL string
+	}{
+		{
+			"wss://cloud.example.com/standalone-signaling/spreed",
+			"https://cloud.example.com/",
+		},
+		{
+			"ws://localhost:8080/standalone-signaling/spreed",
+			"http://localhost:8080/",
+		},
+		{
+			"wss://test.com/standalone-signaling",
+			"https://test.com/",
+		},
+	}
+
+	for _, tt := range tests {
+		cfg := Config{
+			HPBURL: tt.hpbURL,
+			Secret: "test-secret",
+		}
+		client := NewClient(cfg)
+		if client.backendURL != tt.expectedURL {
+			t.Errorf("for %s: expected backend %s, got %s",
+				tt.hpbURL, tt.expectedURL, client.backendURL)
+		}
 	}
 }
