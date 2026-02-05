@@ -112,7 +112,7 @@ Nextcloud Talk (FastAPI Python)
 
 ### Testing Strategy
 
-- **Framework:** Go's standard `testing` package with testify for assertions
+- **Framework:** Go's standard `testing` package
 - **Coverage:** `go test -cover`
 - **Test location:** `*_test.go` alongside package files
 - **Patterns:** Mock servers for HPB/Modal, audio fixtures for pipeline tests
@@ -122,6 +122,12 @@ Nextcloud Talk (FastAPI Python)
 2. Integration tests with mock HPB/Modal servers
 3. Load tests for concurrent speaker capacity
 4. Memory profiling with `pprof`
+
+**Live Testing:**
+- Nextcloud instance: https://cloud.codemyriad.io (AIO install)
+- Test room: https://cloud.codemyriad.io/call/erwcr27x
+- See `LIVE_TESTING.md` for detailed instructions
+- Use `make live-test` for automated basic tests
 
 ### Git Workflow
 
