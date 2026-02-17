@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,6 +30,13 @@ func main() {
 	flag.Parse()
 
 	// Load from environment if flags not set
+	if *port == "8080" {
+		if p := os.Getenv("APP_PORT"); p != "" {
+			*port = p
+		} else if p := os.Getenv("PORT"); p != "" {
+			*port = p
+		}
+	}
 	if *hpbURL == "" {
 		*hpbURL = os.Getenv("LT_HPB_URL")
 	}
@@ -55,6 +64,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Load log level from env if not set via flag
+	if *logLevel == "info" {
+		if ll := os.Getenv("LOG_LEVEL"); ll != "" {
+			*logLevel = ll
+		}
+	}
+
 	// Setup logging
 	logger := setupLogger(*logLevel)
 
@@ -63,20 +79,109 @@ func main() {
 		"hpb_url", *hpbURL,
 		"modal_workspace", *modalWorkspace)
 
+	// Derive HPB backend URL from NEXTCLOUD_URL env var
+	// Must match exactly what's configured in signaling.conf [backend] url
+	hpbBackendURL := os.Getenv("NEXTCLOUD_URL")
+	hpbBackendURL = strings.TrimRight(hpbBackendURL, "/")
+
+	// Load signaling secret (for backend API auth - different from internal secret)
+	hpbSignalingSecret := os.Getenv("LT_SIGNALING_SECRET")
+
 	// Create session manager
 	sessionMgr := session.NewManager(session.ManagerConfig{
-		HPBURL:         *hpbURL,
-		HPBSecret:      *hpbSecret,
-		ModalWorkspace: *modalWorkspace,
-		ModalKey:       *modalKey,
-		ModalSecret:    *modalSecret,
-		MaxSpeakers:    500,
-		Logger:         logger,
+		HPBURL:             *hpbURL,
+		HPBSecret:          *hpbSecret,
+		HPBSignalingSecret: hpbSignalingSecret,
+		HPBBackendURL:      hpbBackendURL,
+		ModalWorkspace:     *modalWorkspace,
+		ModalKey:           *modalKey,
+		ModalSecret:        *modalSecret,
+		MaxSpeakers:        500,
+		Logger:             logger,
 	})
 	defer sessionMgr.Close()
 
+	appID := os.Getenv("APP_ID")
+	if appID == "" {
+		appID = "live_transcription"
+	}
+	appVersion := os.Getenv("APP_VERSION")
+	if appVersion == "" {
+		appVersion = "1.0.0"
+	}
+
+	hpbConfigured := *hpbURL != "" && *hpbSecret != ""
+	modalConfigured := *modalWorkspace != "" && *modalKey != "" && *modalSecret != ""
+
+	// Supported languages in Talk's expected format:
+	// dict of langCode -> {name, metadata: {separator, rtl}}
+	supportedLanguages := map[string]interface{}{
+		"en": map[string]interface{}{
+			"name": "English",
+			"metadata": map[string]interface{}{
+				"separator": " ",
+				"rtl":       false,
+			},
+		},
+		"fr": map[string]interface{}{
+			"name": "Français",
+			"metadata": map[string]interface{}{
+				"separator": " ",
+				"rtl":       false,
+			},
+		},
+	}
+
 	// Setup HTTP server
 	mux := http.NewServeMux()
+
+	// --- Nextcloud ExApp (AppAPI) endpoints ---
+
+	// Heartbeat (no auth required)
+	mux.HandleFunc("GET /heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// Init callback from AppAPI after deployment
+	mux.HandleFunc("POST /init", func(w http.ResponseWriter, r *http.Request) {
+		logger.Info("ExApp init endpoint called")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{})
+	})
+
+	// Enable/disable callbacks (no auth required)
+	mux.HandleFunc("PUT /enabled", func(w http.ResponseWriter, r *http.Request) {
+		logger.Info("ExApp enabled/disabled callback")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{})
+	})
+	mux.HandleFunc("GET /enabled", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"enabled": hpbConfigured && modalConfigured})
+	})
+
+	// Capabilities (no auth required) - Talk looks for 'live_transcription' in features
+	mux.HandleFunc("GET /capabilities", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			appID: map[string]interface{}{
+				"version":  appVersion,
+				"features": []string{"live_transcription"},
+				"live_transcription": map[string]interface{}{
+					"supported_languages": supportedLanguages,
+				},
+			},
+		})
+	})
+
+	// Languages endpoint - returns dict of langCode -> {name, metadata: {separator, rtl}}
+	mux.HandleFunc("GET /api/v1/languages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(supportedLanguages)
+	})
+
+	// --- Service endpoints ---
 
 	// Health check endpoint
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -84,12 +189,22 @@ func main() {
 		fmt.Fprintf(w, `{"status":"healthy","rooms":%d,"speakers":%d,"timestamp":%d}\n`,
 			sessionMgr.RoomCount(), sessionMgr.SpeakerCount(), time.Now().Unix())
 	})
+	// Alias for ExApp health convention
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":           "ok",
+			"version":          appVersion,
+			"modal_configured": modalConfigured,
+			"hpb_configured":   hpbConfigured,
+		})
+	})
 
 	// Transcription endpoints
 	mux.HandleFunc("POST /api/v1/call/transcribe", sessionMgr.HandleTranscribeRequest)
 	mux.HandleFunc("DELETE /api/v1/call/transcribe/{roomToken}", sessionMgr.HandleStopTranscriptionRequest)
 
-	// Metrics endpoint (placeholder)
+	// Metrics endpoint
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprintf(w, "# HELP transcription_rooms_active Number of active rooms\n")

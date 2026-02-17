@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
+	"gopkg.in/hraban/opus.v2"
 )
 
 // Manager handles WebRTC peer connections and audio extraction
@@ -24,15 +25,16 @@ type Manager struct {
 
 // PeerConnection wraps a WebRTC RTCPeerConnection
 type PeerConnection struct {
-	sessionID    string
-	peerConn     *webrtc.PeerConnection
-	audioTrack   *webrtc.TrackRemote
-	rtpReceiver  *webrtc.RTPReceiver
-	closeCh      chan struct{}
+	sessionID     string
+	peerConn      *webrtc.PeerConnection
+	audioTrack    *webrtc.TrackRemote
+	rtpReceiver   *webrtc.RTPReceiver
+	closeCh       chan struct{}
 	wg            sync.WaitGroup
-	sampleRate   int
-	channels     int
+	sampleRate    int
+	channels      int
 	lastFrameTime int64
+	onAudio       func([]float32) // Callback for decoded audio
 }
 
 // NewManager creates a new WebRTC manager
@@ -64,7 +66,7 @@ func NewManager(cfg ConnectionConfig, logger *slog.Logger) (*Manager, error) {
 		config:       &rtcConfig,
 		logger:       logger,
 		peers:        make(map[string]*PeerConnection),
-		audioFrameCh: make(chan AudioFrame, 10), // Bounded channel for audio frames
+		audioFrameCh: make(chan AudioFrame, 10),
 		errCh:        make(chan error, 10),
 		closeCh:      make(chan struct{}),
 	}, nil
@@ -75,8 +77,15 @@ func (m *Manager) CreatePeer(ctx context.Context, sessionID string) (*PeerConnec
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Create RTCPeerConnection
-	peerConn, err := webrtc.NewPeerConnection(*m.config)
+	// Create RTCPeerConnection with increased buffer sizes to avoid
+	// "mux: failed to read from packetio.Buffer short buffer" errors
+	se := webrtc.SettingEngine{}
+	se.SetReceiveMTU(16384)
+	// Increase replay protection window for SRTP
+	se.SetSRTPReplayProtectionWindow(1024)
+
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
+	peerConn, err := api.NewPeerConnection(*m.config)
 	if err != nil {
 		m.logger.Error("failed to create peer connection", "sessionID", sessionID, "error", err)
 		return nil, err
@@ -86,13 +95,13 @@ func (m *Manager) CreatePeer(ctx context.Context, sessionID string) (*PeerConnec
 		sessionID:  sessionID,
 		peerConn:   peerConn,
 		closeCh:    make(chan struct{}),
-		sampleRate: 48000, // Default WebRTC sample rate
-		channels:   1,     // Expect mono from Janus
+		sampleRate: 48000,
+		channels:   1,
 	}
 
 	// Register callbacks
 	peerConn.OnTrack(func(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		peer.onTrack(remoteTrack, receiver, m.audioFrameCh, m.logger)
+		peer.onTrack(remoteTrack, receiver, m.logger)
 	})
 
 	peerConn.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
@@ -115,30 +124,69 @@ func (m *Manager) CreatePeer(ctx context.Context, sessionID string) (*PeerConnec
 	return peer, nil
 }
 
-// onTrack handles incoming audio track
-func (p *PeerConnection) onTrack(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver, frameCh chan AudioFrame, logger *slog.Logger) {
+// SetOnAudio sets the callback for decoded audio data
+func (p *PeerConnection) SetOnAudio(cb func([]float32)) {
+	p.onAudio = cb
+}
+
+// onTrack handles incoming tracks (audio and video)
+func (p *PeerConnection) onTrack(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver, logger *slog.Logger) {
+	codec := remoteTrack.Codec()
+	logger.Info("track received",
+		"sessionID", p.sessionID,
+		"codec", codec.MimeType,
+		"clockRate", codec.ClockRate,
+		"channels", codec.Channels,
+		"kind", remoteTrack.Kind().String(),
+	)
+
+	// Only process audio tracks - ignore video (VP8, etc.)
+	if remoteTrack.Kind() != webrtc.RTPCodecTypeAudio {
+		logger.Debug("ignoring non-audio track", "sessionID", p.sessionID, "codec", codec.MimeType)
+		return
+	}
+
+	// Only accept Opus codec
+	if codec.MimeType != "audio/opus" {
+		logger.Warn("ignoring non-opus audio track", "sessionID", p.sessionID, "codec", codec.MimeType)
+		return
+	}
+
 	p.audioTrack = remoteTrack
 	p.rtpReceiver = receiver
 
-	codec := remoteTrack.Codec()
-	logger.Info("audio track received", "sessionID", p.sessionID, "codec", codec.MimeType)
-
-	// Detect sample rate from codec (Opus typically 48kHz)
-	if codec.ClockRate == 48000 {
-		p.sampleRate = 48000
+	if codec.ClockRate > 0 {
+		p.sampleRate = int(codec.ClockRate)
+	}
+	if codec.Channels > 0 {
+		p.channels = int(codec.Channels)
 	}
 
-	// Start reading audio frames
+	// Start reading and decoding audio frames
 	p.wg.Add(1)
-	go p.readAudioFrames(frameCh, logger)
+	go p.readAndDecodeAudio(logger)
 }
 
-// readAudioFrames reads audio from the track
-func (p *PeerConnection) readAudioFrames(frameCh chan AudioFrame, logger *slog.Logger) {
+// readAndDecodeAudio reads RTP packets, decodes Opus to PCM, and delivers via callback
+func (p *PeerConnection) readAndDecodeAudio(logger *slog.Logger) {
 	defer p.wg.Done()
 
-	// Read audio packets from track
-	rtpBuf := make([]byte, 1400)
+	// Create Opus decoder (48kHz stereo - SDP declares opus/48000/2)
+	channels := p.channels
+	if channels < 1 {
+		channels = 2 // Default to stereo per SDP convention
+	}
+	opusDecoder, err := opus.NewDecoder(48000, channels)
+	if err != nil {
+		logger.Error("failed to create Opus decoder", "sessionID", p.sessionID, "error", err, "channels", channels)
+		return
+	}
+	logger.Debug("Opus decoder created", "sessionID", p.sessionID, "channels", channels)
+
+	// Buffer for decoded PCM (max 120ms at 48kHz * channels = 5760*channels samples)
+	pcmBuf := make([]float32, 5760*channels)
+	frameCount := 0
+
 	for {
 		select {
 		case <-p.closeCh:
@@ -146,32 +194,99 @@ func (p *PeerConnection) readAudioFrames(frameCh chan AudioFrame, logger *slog.L
 		default:
 		}
 
-		n, _, err := p.audioTrack.Read(rtpBuf)
+		// Read RTP packet
+		rtpPacket, _, err := p.audioTrack.ReadRTP()
 		if err != nil {
-			logger.Error("failed to read audio from track", "sessionID", p.sessionID, "error", err)
+			if p.isClosed() {
+				return
+			}
+			logger.Error("failed to read RTP", "sessionID", p.sessionID, "error", err)
 			return
+		}
+
+		if len(rtpPacket.Payload) == 0 {
+			continue
+		}
+
+		frameCount++
+		if frameCount <= 5 || frameCount%100 == 0 {
+			logger.Debug("RTP packet", "sessionID", p.sessionID, "seq", rtpPacket.SequenceNumber,
+				"ts", rtpPacket.Timestamp, "payloadLen", len(rtpPacket.Payload),
+				"pt", rtpPacket.PayloadType, "frameCount", frameCount)
+		}
+
+		// Decode Opus payload to float32 PCM
+		n, err := opusDecoder.DecodeFloat32(rtpPacket.Payload, pcmBuf)
+		if err != nil {
+			logger.Debug("opus decode error", "sessionID", p.sessionID, "error", err, "payloadLen", len(rtpPacket.Payload))
+			continue
 		}
 
 		if n == 0 {
 			continue
 		}
 
-		// Acknowledge receipt; actual audio decoding in audio pipeline
 		p.lastFrameTime = time.Now().UnixMilli()
 
-		// Send frame info (data decoded in audio pipeline)
-		select {
-		case frameCh <- AudioFrame{
-			Data:       make([]float32, 0), // Populated in audio pipeline
-			SampleRate: p.sampleRate,
-			Channels:   p.channels,
-			Timestamp:  p.lastFrameTime,
-		}:
-		case <-p.closeCh:
-			return
-		default:
-			logger.Warn("audio frame channel full, dropping frame", "sessionID", p.sessionID)
+		if frameCount <= 5 || frameCount%500 == 0 {
+			// Log audio values for debugging
+			var peak float32
+			total := n * channels
+			for i := 0; i < total; i++ {
+				v := pcmBuf[i]
+				if v < 0 {
+					v = -v
+				}
+				if v > peak {
+					peak = v
+				}
+			}
+			logger.Debug("decoded audio frame", "sessionID", p.sessionID, "samplesPerCh", n, "channels", channels, "frameCount", frameCount, "peak", peak)
 		}
+
+		// Clamp decoded samples to [-1, 1] range.
+		// Opus DecodeFloat32 can produce values outside this range during
+		// transients or decoder state warmup.
+		total := n * channels
+		for i := 0; i < total; i++ {
+			if pcmBuf[i] > 1.0 {
+				pcmBuf[i] = 1.0
+			} else if pcmBuf[i] < -1.0 {
+				pcmBuf[i] = -1.0
+			}
+		}
+
+		// Deliver decoded PCM via callback (mono)
+		if p.onAudio != nil {
+			if channels == 1 {
+				// Mono: just copy directly
+				samples := make([]float32, n)
+				copy(samples, pcmBuf[:n])
+				p.onAudio(samples)
+			} else {
+				// Stereo: downmix to mono by averaging L/R channels
+				// pcmBuf is interleaved: L0, R0, L1, R1, ...
+				// n is samples per channel, total values = n * channels
+				mono := make([]float32, n)
+				for i := 0; i < n; i++ {
+					var sum float32
+					for ch := 0; ch < channels; ch++ {
+						sum += pcmBuf[i*channels+ch]
+					}
+					mono[i] = sum / float32(channels)
+				}
+				p.onAudio(mono)
+			}
+		}
+	}
+}
+
+func (p *PeerConnection) isClosed() bool {
+	select {
+	case <-p.closeCh:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -187,24 +302,20 @@ func (p *PeerConnection) onConnectionStateChange(state webrtc.PeerConnectionStat
 
 // CreateAnswer creates an SDP answer for a given offer
 func (p *PeerConnection) CreateAnswer(offerSDP string) (string, error) {
-	// Parse offer
 	offer := webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
 		SDP:  offerSDP,
 	}
 
-	// Set remote description
 	if err := p.peerConn.SetRemoteDescription(offer); err != nil {
 		return "", fmt.Errorf("failed to set remote description: %w", err)
 	}
 
-	// Create answer
 	answer, err := p.peerConn.CreateAnswer(nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create answer: %w", err)
 	}
 
-	// Set local description
 	if err := p.peerConn.SetLocalDescription(answer); err != nil {
 		return "", fmt.Errorf("failed to set local description: %w", err)
 	}

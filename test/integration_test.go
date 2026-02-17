@@ -96,10 +96,10 @@ func TestAPIEndpointValidation(t *testing.T) {
 			expectedError:  "roomToken required",
 		},
 		{
-			name:           "unsupported language",
+			name:           "unsupported language falls back to default",
 			body:           `{"roomToken":"test-room","languageId":"ja"}`,
-			expectedStatus: http.StatusBadRequest,
-			expectedError:  "unsupported language",
+			expectedStatus: http.StatusInternalServerError,
+			expectedError:  "failed to connect to HPB",
 		},
 		{
 			name:           "invalid JSON",
@@ -129,7 +129,7 @@ func TestAPIEndpointValidation(t *testing.T) {
 	}
 }
 
-// TestAPIMethodValidation tests HTTP method validation
+// TestAPIMethodValidation tests HTTP method validation via ServeMux routing
 func TestAPIMethodValidation(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelWarn,
@@ -145,11 +145,14 @@ func TestAPIMethodValidation(t *testing.T) {
 	})
 	defer mgr.Close()
 
-	// Test wrong HTTP method
+	// Test wrong HTTP method via ServeMux (which enforces method routing)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/call/transcribe", mgr.HandleTranscribeRequest)
+
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/call/transcribe", nil)
 	rec := httptest.NewRecorder()
 
-	mgr.HandleTranscribeRequest(rec, req)
+	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("expected status %d for GET, got %d", http.StatusMethodNotAllowed, rec.Code)

@@ -29,8 +29,9 @@ type Transcriber struct {
 	audioCache   *audio.ChunkBuffer
 	modalClient  *modal.Client
 	audioPipe    *audio.Pipeline
-	audioInputCh chan []int16   // Raw audio frames from WebRTC
-	audioOutCh   chan []float32 // Processed audio chunks for Modal
+	audioInputCh chan []float32 // Decoded float32 PCM from WebRTC (48kHz)
+	audioOutCh   chan []float32 // Processed audio chunks for Modal (24kHz)
+	broadcast    func(text string, final bool) // Callback to broadcast transcript to room participants
 	mu           sync.Mutex
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -43,9 +44,12 @@ type Room struct {
 	LanguageID   string
 	HPBClient    *hpb.Client
 	WebRTCMgr    *webrtc.Manager
-	Speakers     map[string]*Speaker  // sessionID -> Speaker
-	ModalClients map[string]*modal.Client // sessionID -> Modal client
+	Speakers     map[string]*Speaker  // HPB sessionID -> Speaker
+	ModalClients map[string]*modal.Client // HPB sessionID -> Modal client
 	modalConfig  modal.Config // Modal client configuration
+	// Session ID mapping: OCS session ID ↔ HPB session ID
+	ocsToHPB     map[string]string // OCS roomsessionid -> HPB sessionid
+	hpbToOCS     map[string]string // HPB sessionid -> OCS roomsessionid
 	mu           sync.RWMutex
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -55,24 +59,28 @@ type Room struct {
 
 // Manager manages multiple rooms
 type Manager struct {
-	rooms        map[string]*Room  // roomToken -> Room
-	mu           sync.RWMutex
-	logger       *slog.Logger
-	hpbURL       string
-	hpbSecret    string
-	modalConfig  modal.Config
-	maxSpeakers  int
+	rooms              map[string]*Room  // roomToken -> Room
+	mu                 sync.RWMutex
+	logger             *slog.Logger
+	hpbURL             string
+	hpbSecret          string // Internal client secret
+	hpbSignalingSecret string // Backend signaling secret
+	hpbBackendURL      string
+	modalConfig        modal.Config
+	maxSpeakers        int
 }
 
 // ManagerConfig holds configuration for the session manager
 type ManagerConfig struct {
-	HPBURL          string
-	HPBSecret       string
-	ModalWorkspace  string
-	ModalKey        string
-	ModalSecret     string
-	MaxSpeakers     int
-	Logger          *slog.Logger
+	HPBURL             string
+	HPBSecret          string // Internal client secret (for WebSocket auth)
+	HPBSignalingSecret string // Backend signaling secret (for HTTP API auth)
+	HPBBackendURL      string // Nextcloud backend URL for HPB auth
+	ModalWorkspace     string
+	ModalKey           string
+	ModalSecret        string
+	MaxSpeakers        int
+	Logger             *slog.Logger
 }
 
 // NewManager creates a new session manager
@@ -86,11 +94,13 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 
 	return &Manager{
-		rooms:       make(map[string]*Room),
-		logger:      cfg.Logger,
-		hpbURL:      cfg.HPBURL,
-		hpbSecret:   cfg.HPBSecret,
-		maxSpeakers: cfg.MaxSpeakers,
+		rooms:              make(map[string]*Room),
+		logger:             cfg.Logger,
+		hpbURL:             cfg.HPBURL,
+		hpbSecret:          cfg.HPBSecret,
+		hpbSignalingSecret: cfg.HPBSignalingSecret,
+		hpbBackendURL:      cfg.HPBBackendURL,
+		maxSpeakers:        cfg.MaxSpeakers,
 		modalConfig: modal.Config{
 			Workspace: cfg.ModalWorkspace,
 			Key:       cfg.ModalKey,
@@ -113,9 +123,11 @@ func (m *Manager) JoinRoom(ctx context.Context, roomToken, languageID string, tu
 
 	// Create HPB client
 	hpbClient := hpb.NewClient(hpb.Config{
-		HPBURL: m.hpbURL,
-		Secret: m.hpbSecret,
-		Logger: m.logger,
+		HPBURL:          m.hpbURL,
+		BackendURL:      m.hpbBackendURL,
+		Secret:          m.hpbSecret,
+		SignalingSecret: m.hpbSignalingSecret,
+		Logger:          m.logger,
 	})
 
 	if err := hpbClient.Connect(ctx); err != nil {
@@ -154,6 +166,8 @@ func (m *Manager) JoinRoom(ctx context.Context, roomToken, languageID string, tu
 		Speakers:     make(map[string]*Speaker),
 		ModalClients: make(map[string]*modal.Client),
 		modalConfig:  m.modalConfig,
+		ocsToHPB:     make(map[string]string),
+		hpbToOCS:     make(map[string]string),
 		ctx:          roomCtx,
 		cancel:       cancel,
 		logger:       m.logger,
@@ -175,6 +189,7 @@ func (r *Room) orchestrationLoop() {
 	defer r.wg.Done()
 
 	hpbMsgCh := r.HPBClient.MessageChan()
+	hpbErrCh := r.HPBClient.ErrorChan()
 
 	for {
 		select {
@@ -182,7 +197,45 @@ func (r *Room) orchestrationLoop() {
 			return
 		case msg := <-hpbMsgCh:
 			r.handleHPBMessage(msg)
+		case err := <-hpbErrCh:
+			r.logger.Warn("HPB connection error, reconnecting", "error", err)
+			r.reconnectHPB()
 		}
+	}
+}
+
+// reconnectHPB attempts to reconnect to HPB with backoff
+func (r *Room) reconnectHPB() {
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		default:
+		}
+
+		time.Sleep(backoff)
+
+		r.logger.Info("attempting HPB reconnection", "roomToken", r.RoomToken)
+		if err := r.HPBClient.Connect(r.ctx); err != nil {
+			r.logger.Error("HPB reconnection failed", "error", err, "nextBackoff", backoff*2)
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		// Re-join the room after reconnecting
+		if err := r.HPBClient.JoinRoom(r.RoomToken); err != nil {
+			r.logger.Error("failed to rejoin room after HPB reconnection", "error", err)
+			continue
+		}
+
+		r.logger.Info("HPB reconnected and room rejoined", "roomToken", r.RoomToken)
+		return
 	}
 }
 
@@ -191,69 +244,217 @@ func (r *Room) handleHPBMessage(msg interface{}) {
 	switch m := msg.(type) {
 	case *hpb.RoomMessage:
 		r.handleRoomMessage(m)
+	case *hpb.EventMessage:
+		r.handleEventMessage(m)
 	case *hpb.MessageMessage:
 		r.handleSignalingMessage(m)
 	case *hpb.ByeMessage:
 		r.handleByeMessage(m)
+	case *hpb.HelloResponse:
+		r.logger.Debug("hello response received (already processed by HPB client)")
 	default:
 		r.logger.Debug("unhandled HPB message type", "type", fmt.Sprintf("%T", msg))
 	}
 }
 
-// handleRoomMessage processes room topology updates
+// handleRoomMessage processes room join confirmation.
+// Note: HPB room responses do NOT include participants. Participants arrive
+// via separate "event" messages with target "participants".
 func (r *Room) handleRoomMessage(msg *hpb.RoomMessage) {
-	r.logger.Debug("room message received", "participants", len(msg.Participants))
+	r.logger.Info("room join confirmed", "roomID", msg.Room.RoomID)
+}
 
-	// Process participants
-	for _, participant := range msg.Participants {
-		if participant.Audio && participant.InCall {
-			r.addSpeaker(participant.SessionID, participant.UserID, participant.Name)
+// handleEventMessage processes events from HPB.
+// target "room": join/leave notifications (session IDs only)
+// target "participants": full user updates with inCall flags from the Nextcloud backend
+func (r *Room) handleEventMessage(msg *hpb.EventMessage) {
+	r.logger.Debug("event received", "target", msg.Event.Target, "type", msg.Event.Type)
+
+	switch msg.Event.Target {
+	case "room":
+		r.handleRoomEvent(msg)
+	case "participants":
+		r.handleParticipantsEvent(msg)
+	default:
+		r.logger.Debug("unhandled event target", "target", msg.Event.Target)
+	}
+}
+
+// handleRoomEvent handles room-level join/leave events
+func (r *Room) handleRoomEvent(msg *hpb.EventMessage) {
+	// Process join events - add speakers directly
+	for _, entry := range msg.Event.Join {
+		r.logger.Info("session joined room", "sessionID", entry.SessionID, "userID", entry.UserID)
+
+		// Build session ID mapping
+		if entry.RoomSessionID != "" {
+			r.mu.Lock()
+			r.ocsToHPB[entry.RoomSessionID] = entry.SessionID
+			r.hpbToOCS[entry.SessionID] = entry.RoomSessionID
+			r.mu.Unlock()
+		}
+
+		// Skip our own session
+		if entry.SessionID == r.HPBClient.SessionID() {
+			continue
+		}
+
+		// Add as speaker immediately (don't wait for participants update)
+		displayName := entry.UserID
+		if entry.User != nil {
+			if dn, ok := entry.User["displayname"].(string); ok && dn != "" {
+				displayName = dn
+			}
+		}
+		r.addSpeaker(entry.SessionID, entry.UserID, displayName)
+	}
+	// Handle leaves
+	for _, sessionID := range msg.Event.Leave {
+		r.logger.Info("session left room", "sessionID", sessionID)
+		r.removeSpeaker(sessionID)
+	}
+}
+
+// handleParticipantsEvent handles participants update from Nextcloud backend.
+// This is the main way we learn about who is in the call with audio.
+func (r *Room) handleParticipantsEvent(msg *hpb.EventMessage) {
+	update := msg.Event.Update
+	if update == nil {
+		r.logger.Debug("participants event with nil update")
+		return
+	}
+
+	// Check if everyone left the call
+	if update.All {
+		if incall, ok := update.InCall.(float64); ok && incall == 0 {
+			r.logger.Info("call ended for everyone")
+			return
+		}
+	}
+
+	users := update.Users
+	if len(users) == 0 {
+		users = update.Changed
+	}
+
+	r.logger.Info("participants update", "userCount", len(users))
+
+	for _, user := range users {
+		ocsSessionID, _ := user["sessionId"].(string)
+		if ocsSessionID == "" {
+			continue
+		}
+
+		// Skip internal sessions (that's us)
+		if internal, ok := user["internal"].(bool); ok && internal {
+			continue
+		}
+
+		// Translate OCS session ID to HPB session ID
+		r.mu.RLock()
+		hpbSessionID, mapped := r.ocsToHPB[ocsSessionID]
+		r.mu.RUnlock()
+
+		if !mapped {
+			r.logger.Debug("no HPB session mapping for OCS session", "ocsSessionID_len", len(ocsSessionID))
+			continue
+		}
+
+		// Parse inCall flags
+		var inCallFlags int
+		switch v := user["inCall"].(type) {
+		case float64:
+			inCallFlags = int(v)
+		case int:
+			inCallFlags = v
+		}
+
+		inCall := inCallFlags&hpb.CallFlagInCall != 0
+		withAudio := inCallFlags&2 != 0 // WITH_AUDIO = 2
+
+		userID, _ := user["userId"].(string)
+		displayName, _ := user["displayname"].(string)
+		if displayName == "" {
+			displayName = userID
+		}
+
+		r.logger.Debug("participant status",
+			"hpbSessionID", hpbSessionID, "userID", userID, "inCall", inCallFlags,
+			"isInCall", inCall, "withAudio", withAudio)
+
+		if inCallFlags == 0 {
+			// User disconnected
+			r.removeSpeaker(hpbSessionID)
+		} else if inCall && withAudio {
+			r.addSpeaker(hpbSessionID, userID, displayName)
 		}
 	}
 }
 
 // handleSignalingMessage processes WebRTC signaling (offers/answers/ICE)
+// MCU messages use format: {type: "offer"/"answer", from: sessionID, payload: {type, sdp}, roomType: "video"}
 func (r *Room) handleSignalingMessage(msg *hpb.MessageMessage) {
-	// Extract SDP offer from message data (Janus format)
-	if msg.Data == nil {
+	data := msg.Message.Data
+	if data == nil {
 		return
 	}
 
-	// Convert data to map[string]interface{}
-	dataJSON, err := json.Marshal(msg.Data)
-	if err != nil {
-		r.logger.Debug("failed to marshal message data", "from", msg.From, "error", err)
-		return
+	senderID := ""
+	if msg.Message.Sender != nil {
+		senderID = msg.Message.Sender.SessionID
 	}
 
-	var dataMap map[string]interface{}
-	if err := json.Unmarshal(dataJSON, &dataMap); err != nil {
-		r.logger.Debug("failed to unmarshal message data", "from", msg.From, "error", err)
-		return
-	}
+	msgType, _ := data["type"].(string)
+	r.logger.Debug("signaling message", "type", msgType, "from", senderID, "dataKeys", fmt.Sprintf("%v", mapKeys(data)))
 
-	// Handle offer
-	if offer, exists := dataMap["offer"]; exists {
-		offerStr, ok := offer.(map[string]interface{})
+	switch msgType {
+	case "offer":
+		// MCU sends offer with payload containing the SDP
+		payload, ok := data["payload"].(map[string]interface{})
 		if !ok {
+			r.logger.Warn("offer missing payload")
 			return
 		}
-
-		sdp, ok := offerStr["sdp"].(string)
+		sdp, ok := payload["sdp"].(string)
 		if !ok {
+			r.logger.Warn("offer payload missing sdp")
 			return
 		}
+		// Use "from" field as the publisher session ID for subscriber connections
+		fromID, _ := data["from"].(string)
+		if fromID != "" {
+			senderID = fromID
+		}
+		r.handleOffer(senderID, sdp)
 
-		sessionID := msg.From
-		r.handleOffer(sessionID, sdp)
-	}
+	case "candidate":
+		// ICE candidate from MCU
+		payload, ok := data["candidate"].(map[string]interface{})
+		if !ok {
+			// Try payload field
+			payload, ok = data["payload"].(map[string]interface{})
+		}
+		if ok {
+			candStr, _ := json.Marshal(payload)
+			fromID, _ := data["from"].(string)
+			if fromID != "" {
+				senderID = fromID
+			}
+			r.handleICECandidate(senderID, string(candStr))
+		}
 
-	// Handle ICE candidates
-	if candidate, exists := dataMap["candidate"]; exists {
-		sessionID := msg.From
-		candStr, _ := json.Marshal(candidate)
-		r.handleICECandidate(sessionID, string(candStr))
+	default:
+		r.logger.Debug("unhandled signaling message type", "type", msgType, "data", data)
 	}
+}
+
+// mapKeys returns the keys of a map for debug logging
+func mapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // handleOffer creates an answer for the SDP offer
@@ -271,15 +472,22 @@ func (r *Room) handleOffer(sessionID, offerSDP string) {
 		return
 	}
 
-	// Send answer back via HPB
+	// Send answer back via HPB using MCU message format
 	answerMsg := hpb.MessageMessage{
-		Type:      "message",
-		To:        sessionID,
-		RoomToken: r.RoomToken,
-		Data: map[string]interface{}{
-			"answer": map[string]interface{}{
-				"type": "answer",
-				"sdp":  answerSDP,
+		Type: "message",
+		Message: hpb.MessageEnvelope{
+			Recipient: &hpb.MessageRecipient{
+				Type:      "session",
+				SessionID: sessionID,
+			},
+			Data: map[string]interface{}{
+				"type":     "answer",
+				"roomType": "video",
+				"to":       sessionID,
+				"payload": map[string]interface{}{
+					"type": "answer",
+					"sdp":  answerSDP,
+				},
 			},
 		},
 	}
@@ -349,15 +557,39 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 		return err
 	}
 
+	langID := r.LanguageID
+	// Use the bot's own HPB session ID as speakerSessionId so that every
+	// browser (including the actual speaker's) has a matching CallParticipantModel
+	// and can display the transcript. Using the real speaker's ID would cause
+	// the speaker's own browser to drop the transcript (no model for self).
+	botSessionID := r.HPBClient.SessionID()
 	transcriber := &Transcriber{
 		sessionID:    sessionID,
 		peerConn:     peerConn,
-		audioCache:   audio.NewChunkBuffer(24000, 200, r.logger),
+		audioCache:   audio.NewChunkBuffer(24000, 80, r.logger), // 80ms chunks to match Modal Rust server expectations
 		modalClient:  modalClient,
 		audioPipe:    audioPipe,
-		audioInputCh: make(chan []int16, 100),   // Bounded: ~2s of audio frames
-		audioOutCh:   make(chan []float32, 10),  // Bounded: 10 chunks of 200ms
+		audioInputCh: make(chan []float32, 500),   // Bounded: ~10s of audio frames
+		audioOutCh:   make(chan []float32, 200),   // Bounded: ~16s of 80ms chunks
+		broadcast: func(text string, final bool) {
+			// Broadcast transcript to all room participants via HPB backend API.
+			// This sends an HTTP POST to the signaling server which broadcasts
+			// the message as a room event to all connected clients.
+			r.logger.Info("broadcasting transcript", "text", text, "speaker", sessionID, "bot", botSessionID, "room", r.RoomToken)
+			if err := r.HPBClient.SendTranscriptViaBackend(r.RoomToken, text, langID, botSessionID, final); err != nil {
+				r.logger.Error("failed to broadcast transcript via backend API", "error", err)
+			}
+		},
 	}
+
+	// Wire WebRTC decoded audio to transcriber input
+	peerConn.SetOnAudio(func(samples []float32) {
+		select {
+		case transcriber.audioInputCh <- samples:
+		default:
+			// Drop if full (backpressure)
+		}
+	})
 
 	// Create speaker record
 	speaker := &Speaker{
@@ -377,10 +609,31 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 
 	r.logger.Info("speaker added", "sessionID", sessionID, "name", name, "roomToken", r.RoomToken)
 
+	// Send requestoffer to subscribe to participant's audio via MCU
+	requestOffer := hpb.MessageMessage{
+		Type: "message",
+		Message: hpb.MessageEnvelope{
+			Recipient: &hpb.MessageRecipient{
+				Type:      "session",
+				SessionID: sessionID,
+			},
+			Data: map[string]interface{}{
+				"type":     "requestoffer",
+				"roomType": "video",
+			},
+		},
+	}
+	if err := r.HPBClient.SendMessage(requestOffer); err != nil {
+		r.logger.Error("failed to send requestoffer", "sessionID", sessionID, "error", err)
+	} else {
+		r.logger.Info("sent requestoffer to participant", "sessionID", sessionID)
+	}
+
 	return nil
 }
 
-// removeSpeaker removes a speaker from the room
+// removeSpeaker removes a speaker from the room.
+// Caller must NOT hold r.mu.
 func (r *Room) removeSpeaker(sessionID string) error {
 	r.mu.Lock()
 	speaker, exists := r.Speakers[sessionID]
@@ -389,13 +642,14 @@ func (r *Room) removeSpeaker(sessionID string) error {
 		return fmt.Errorf("speaker not found: %s", sessionID)
 	}
 	delete(r.Speakers, sessionID)
-
-	// Close Modal client
-	if modalClient, ok := r.ModalClients[sessionID]; ok {
-		modalClient.Close()
-		delete(r.ModalClients, sessionID)
-	}
+	delete(r.ModalClients, sessionID)
 	r.mu.Unlock()
+
+	// Cancel transcriber context and wait for goroutines to exit.
+	// This also closes the modal client via the deferred Close in run().
+	if speaker.Transcriber != nil {
+		speaker.Transcriber.Close()
+	}
 
 	// Close WebRTC peer
 	if err := r.WebRTCMgr.RemovePeer(sessionID); err != nil {
@@ -421,14 +675,19 @@ func (m *Manager) LeaveRoom(roomToken string) error {
 	// Cancel room context (stops orchestration loop)
 	room.cancel()
 
-	// Close all speakers
-	room.mu.Lock()
+	// Collect speaker IDs under lock, then remove without lock (removeSpeaker locks internally)
+	room.mu.RLock()
+	sessionIDs := make([]string, 0, len(room.Speakers))
 	for sessionID := range room.Speakers {
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+	room.mu.RUnlock()
+
+	for _, sessionID := range sessionIDs {
 		if err := room.removeSpeaker(sessionID); err != nil {
 			room.logger.Error("failed to remove speaker", "sessionID", sessionID, "error", err)
 		}
 	}
-	room.mu.Unlock()
 
 	// Close WebRTC manager
 	if err := room.WebRTCMgr.Close(); err != nil {

@@ -64,23 +64,35 @@ type InCallData struct {
 	InCall int `json:"incall"` // 1 = IN_CALL
 }
 
-// RoomMessage contains room topology and configuration
+// RoomMessage is the HPB room join response.
+// HPB nests the room data under a "room" key: {"type":"room","room":{"roomid":"...",...}}
 type RoomMessage struct {
-	Type         string        `json:"type"` // "room"
+	Type string       `json:"type"` // "room"
+	ID   string       `json:"id,omitempty"`
+	Room RoomInner    `json:"room"`
+	// Legacy flat fields for backward compatibility with tests
 	RoomToken    string        `json:"token,omitempty"`
-	SessionID    string        `json:"sessionid,omitempty"`
-	ResumeID     string        `json:"resumeid,omitempty"`
-	Properties   RoomProperties `json:"properties,omitempty"`
-	Participants []Participant `json:"participants,omitempty"`
-	STUNServers  []string      `json:"stunservers,omitempty"`
-	TURNServers  []TURNServer  `json:"turnservers,omitempty"`
 }
 
-// RoomProperties contains room settings
+// RoomInner contains the nested room data from HPB
+type RoomInner struct {
+	RoomID     string          `json:"roomid"`
+	Properties *RoomProperties `json:"properties,omitempty"`
+	Bandwidth  *RoomBandwidth  `json:"bandwidth,omitempty"`
+}
+
+// RoomBandwidth contains bandwidth limits from HPB
+type RoomBandwidth struct {
+	MaxStreamBitrate int `json:"maxstreambitrate,omitempty"`
+	MaxScreenBitrate int `json:"maxscreenbitrate,omitempty"`
+}
+
+// RoomProperties contains room settings.
+// Fields are interface{} because HPB sends numeric types (not strings/bools).
 type RoomProperties struct {
-	InCall   bool   `json:"incall"`
-	RoomType string `json:"type"` // "room", "group", etc
-	Breakout *int   `json:"breakout,omitempty"`
+	InCall   interface{} `json:"incall"`   // int flags or bool
+	RoomType interface{} `json:"type"`     // int room type
+	Name     string      `json:"name,omitempty"`
 }
 
 // Participant represents a room participant
@@ -101,21 +113,27 @@ type TURNServer struct {
 	Credential string   `json:"credential,omitempty"`
 }
 
-// MessageMessage contains call signaling data
+// MessageMessage contains call signaling data from HPB
+// HPB wraps the content in a nested "message" field:
+// {"type": "message", "id": "42", "message": {"sender": {...}, "recipient": {...}, "data": {...}}}
 type MessageMessage struct {
-	Type      string                 `json:"type"` // "message"
-	From      string                 `json:"from,omitempty"`
-	To        string                 `json:"to,omitempty"`
-	RoomType  string                 `json:"roomType,omitempty"`
-	RoomToken string                 `json:"roomToken,omitempty"`
+	Type    string          `json:"type"`         // "message"
+	ID      string          `json:"id,omitempty"` // message correlation ID
+	Message MessageEnvelope `json:"message"`
+}
+
+// MessageEnvelope is the inner content of a message
+type MessageEnvelope struct {
+	Sender    *MessageParty          `json:"sender,omitempty"`
 	Recipient *MessageRecipient      `json:"recipient,omitempty"`
 	Data      map[string]interface{} `json:"data,omitempty"`
-	Sid       string                 `json:"sid,omitempty"`
-	Refresh   string                 `json:"refresh,omitempty"`
-	Token     string                 `json:"token,omitempty"`
-	URLPath   string                 `json:"url_path,omitempty"`
-	URLQuery  string                 `json:"url_query,omitempty"`
-	URLTarget string                 `json:"url_target,omitempty"`
+}
+
+// MessageParty identifies a message sender
+type MessageParty struct {
+	Type      string `json:"type"`
+	SessionID string `json:"sessionid,omitempty"`
+	UserID    string `json:"userid,omitempty"`
 }
 
 // MessageRecipient identifies who this message is for
@@ -154,11 +172,39 @@ type EventMessage struct {
 	Event EventInner `json:"event"`
 }
 
-// EventInner contains event details
+// EventInner contains event details.
+// For target "room": uses Join/Leave/Change fields.
+// For target "participants": uses Update field (RoomEventUpdate).
 type EventInner struct {
-	Target string                 `json:"target"` // "room", "participants"
-	Type   string                 `json:"type"`   // "join", "leave", "update"
-	Update map[string]interface{} `json:"update,omitempty"`
+	Target string `json:"target"` // "room", "participants"
+	Type   string `json:"type"`   // "join", "leave", "update"
+
+	// Used for target "room"
+	Join   []EventSessionEntry `json:"join,omitempty"`
+	Leave  []string            `json:"leave,omitempty"` // Session IDs leaving
+	Change []EventSessionEntry `json:"change,omitempty"`
+
+	// Used for target "participants"
+	Update *RoomEventUpdate `json:"update,omitempty"`
+}
+
+// EventSessionEntry represents a session in a room join/leave/change event
+type EventSessionEntry struct {
+	SessionID     string                 `json:"sessionid"`
+	UserID        string                 `json:"userid,omitempty"`
+	RoomSessionID string                 `json:"roomsessionid,omitempty"` // OCS session ID
+	User          map[string]interface{} `json:"user,omitempty"`
+	Features      []string               `json:"features,omitempty"`
+}
+
+// RoomEventUpdate represents a participants update from the Nextcloud backend.
+// Sent as event.update when target is "participants".
+type RoomEventUpdate struct {
+	RoomID  string                   `json:"roomid,omitempty"`
+	InCall  interface{}              `json:"incall,omitempty"`  // Global incall status
+	All     bool                     `json:"all,omitempty"`     // True if applies to all users
+	Changed []map[string]interface{} `json:"changed,omitempty"` // Changed participants
+	Users   []map[string]interface{} `json:"users,omitempty"`   // Full participant list
 }
 
 // WelcomeMessage is received on initial connection
@@ -181,3 +227,18 @@ type PongMessage struct {
 const (
 	CallFlagInCall = 1 // IN_CALL flag
 )
+
+// RoomJoinRequest is sent to join a room via HPB signaling
+type RoomJoinRequest struct {
+	Type string        `json:"type"` // "room"
+	ID   string        `json:"id,omitempty"`
+	Room RoomJoinInner `json:"room"`
+}
+
+// RoomJoinInner contains room join parameters
+type RoomJoinInner struct {
+	RoomID    string `json:"roomid"`              // Room token
+	SessionID string `json:"sessionid,omitempty"` // Nextcloud session ID
+}
+
+// TranscriptMessage is kept for backward compatibility - use MessageMessage with proper envelope instead

@@ -1,6 +1,7 @@
 package hpb
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -8,7 +9,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,29 +22,39 @@ import (
 
 // Client manages WebSocket connection to HPB with reconnection and internal auth
 type Client struct {
-	hpbURL     string
-	backendURL string
-	secret     string
-	resumeID   string
-	sessionID  string
-	conn       *websocket.Conn
-	mu         sync.Mutex
-	logger     *slog.Logger
-	msgChan    chan interface{}
-	errChan    chan error
-	closeChan  chan struct{}
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	msgID      atomic.Int64
+	hpbURL           string
+	backendURL       string
+	secret           string // Internal client secret (for WebSocket HMAC auth)
+	signalingSecret  string // Backend signaling secret (for HTTP API auth)
+	ticketURL        string
+	ticket           string
+	token            string // JWT token for v2.0 auth
+	resumeID         string
+	sessionID        string
+	conn             *websocket.Conn
+	mu               sync.Mutex
+	logger           *slog.Logger
+	msgChan          chan interface{}
+	errChan          chan error
+	closeChan        chan struct{}
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	msgID            atomic.Int64
 }
 
 // Config holds HPB client configuration
 type Config struct {
-	HPBURL     string       // HPB WebSocket URL
-	BackendURL string       // Nextcloud backend URL (for auth)
-	Secret     string       // HMAC secret for authentication
-	Logger     *slog.Logger // Logger instance
+	HPBURL          string       // HPB WebSocket URL
+	BackendURL      string       // Nextcloud backend URL (for auth)
+	Secret          string       // HMAC secret for internal WebSocket authentication
+	SignalingSecret string       // Backend signaling secret (for HTTP API auth, different from internal secret)
+	// Ticket-based auth v1.0 (for regular users, mutually exclusive with Secret)
+	TicketURL string // Auth URL from signaling settings helloAuthParams
+	Ticket    string // Ticket from signaling settings helloAuthParams
+	// JWT token auth v2.0 (newer signaling)
+	Token     string       // JWT token from signaling settings helloAuthParams["2.0"].token
+	Logger    *slog.Logger // Logger instance
 }
 
 // NewClient creates a new HPB client
@@ -69,9 +82,13 @@ func NewClient(cfg Config) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Client{
-		hpbURL:     cfg.HPBURL,
-		backendURL: cfg.BackendURL,
-		secret:     cfg.Secret,
+		hpbURL:          cfg.HPBURL,
+		backendURL:      cfg.BackendURL,
+		secret:          cfg.Secret,
+		signalingSecret: cfg.SignalingSecret,
+		ticketURL:       cfg.TicketURL,
+		ticket:          cfg.Ticket,
+		token:           cfg.Token,
 		logger:     cfg.Logger,
 		msgChan:    make(chan interface{}, 100), // Bounded message queue
 		errChan:    make(chan error, 10),
@@ -85,6 +102,19 @@ func NewClient(cfg Config) *Client {
 func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Close any existing connection
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+
+	// Reset closeChan if already closed (reconnection)
+	select {
+	case <-c.closeChan:
+		c.closeChan = make(chan struct{})
+	default:
+	}
 
 	// Connect to HPB
 	dialer := websocket.Dialer{
@@ -129,8 +159,19 @@ func hmacSHA256(secret, data string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// sendHello sends initial hello message to HPB with internal auth
+// sendHello sends initial hello message to HPB with internal, ticket, or JWT auth
 func (c *Client) sendHello() error {
+	if c.token != "" {
+		return c.sendHelloToken()
+	}
+	if c.ticket != "" {
+		return c.sendHelloTicket()
+	}
+	return c.sendHelloInternal()
+}
+
+// sendHelloInternal sends hello with HMAC-based internal auth
+func (c *Client) sendHelloInternal() error {
 	nonce := generateNonce()
 	token := hmacSHA256(c.secret, nonce)
 
@@ -155,7 +196,57 @@ func (c *Client) sendHello() error {
 		return err
 	}
 
-	c.logger.Debug("sending hello to HPB", "resumeID", c.resumeID, "backend", c.backendURL)
+	c.logger.Debug("sending hello to HPB (internal auth)", "backend", c.backendURL)
+	return c.conn.WriteMessage(websocket.TextMessage, data)
+}
+
+// sendHelloTicket sends hello with ticket-based user auth
+func (c *Client) sendHelloTicket() error {
+	hello := map[string]interface{}{
+		"type": "hello",
+		"id":   c.nextMsgID(),
+		"hello": map[string]interface{}{
+			"version": "2.0",
+			"auth": map[string]interface{}{
+				"url": c.ticketURL,
+				"params": map[string]interface{}{
+					"ticket": c.ticket,
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(hello)
+	if err != nil {
+		return err
+	}
+
+	c.logger.Debug("sending hello to HPB (ticket auth)", "url", c.ticketURL)
+	return c.conn.WriteMessage(websocket.TextMessage, data)
+}
+
+// sendHelloToken sends hello with JWT token auth (v2.0)
+func (c *Client) sendHelloToken() error {
+	hello := map[string]interface{}{
+		"type": "hello",
+		"id":   c.nextMsgID(),
+		"hello": map[string]interface{}{
+			"version": "2.0",
+			"auth": map[string]interface{}{
+				"url": c.backendURL + "ocs/v2.php/apps/spreed/api/v3/signaling/backend",
+				"params": map[string]interface{}{
+					"token": c.token,
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(hello)
+	if err != nil {
+		return err
+	}
+
+	c.logger.Debug("sending hello to HPB (JWT token auth)", "backend", c.backendURL)
 	return c.conn.WriteMessage(websocket.TextMessage, data)
 }
 
@@ -180,12 +271,16 @@ func (c *Client) readLoop() {
 			continue
 		}
 
-		c.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		// Use longer read deadline since pings keep connection alive
+		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
-			if !strings.Contains(err.Error(), "context canceled") {
+			if !strings.Contains(err.Error(), "context canceled") && !strings.Contains(err.Error(), "use of closed") {
 				c.logger.Error("HPB read error", "error", err)
-				c.errChan <- err
+				select {
+				case c.errChan <- err:
+				default:
+				}
 			}
 			return
 		}
@@ -219,7 +314,8 @@ func (c *Client) writeLoop() {
 	}
 }
 
-// sendPing sends a keep-alive ping
+// sendPing sends a WebSocket-level ping frame (not an application-level message).
+// The HPB signaling server has no "ping" message type handler.
 func (c *Client) sendPing() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -228,10 +324,7 @@ func (c *Client) sendPing() error {
 		return fmt.Errorf("connection closed")
 	}
 
-	msg := PingMessage{Type: "ping"}
-	data, _ := json.Marshal(msg)
-
-	return c.conn.WriteMessage(websocket.TextMessage, data)
+	return c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
 }
 
 // handleMessage routes incoming messages to appropriate handlers
@@ -278,6 +371,7 @@ func (c *Client) handleMessage(data []byte) error {
 		if err := json.Unmarshal(msgData, &msg); err != nil {
 			return err
 		}
+		c.logger.Debug("raw event data", "data", string(msgData))
 		c.onEvent(&msg)
 
 	case "message":
@@ -318,50 +412,70 @@ func (c *Client) handleMessage(data []byte) error {
 // onHello handles hello response from HPB
 func (c *Client) onHello(msg *HelloResponse) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	c.resumeID = msg.Hello.ResumeID
 	c.sessionID = msg.Hello.SessionID
+	c.mu.Unlock()
+
 	c.logger.Info("HPB hello response", "resumeID", c.resumeID, "sessionID", c.sessionID)
 
-	// Send copy to message channel
-	c.msgChan <- msg
+	select {
+	case c.msgChan <- msg:
+	case <-c.ctx.Done():
+	default:
+		c.logger.Warn("HPB message channel full, dropping hello")
+	}
 }
 
-// onRoom handles room topology from HPB
+// onRoom handles room join confirmation from HPB
 func (c *Client) onRoom(msg *RoomMessage) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.logger.Info("received room join response", "roomID", msg.Room.RoomID)
 
-	c.logger.Info("received room topology", "token", msg.RoomToken, "participants", len(msg.Participants),
-		"stun_servers", len(msg.STUNServers), "turn_servers", len(msg.TURNServers))
-
-	// Send copy to message channel
-	c.msgChan <- msg
+	select {
+	case c.msgChan <- msg:
+	case <-c.ctx.Done():
+	default:
+		c.logger.Warn("HPB message channel full, dropping room message")
+	}
 }
 
 // onEvent handles room/participant events
 func (c *Client) onEvent(msg *EventMessage) {
 	c.logger.Debug("received event", "target", msg.Event.Target, "type", msg.Event.Type)
 
-	// Send copy to message channel
-	c.msgChan <- msg
+	select {
+	case c.msgChan <- msg:
+	case <-c.ctx.Done():
+	default:
+		c.logger.Warn("HPB message channel full, dropping event")
+	}
 }
 
 // onMessage handles signaling message (SDP offer/answer, ICE candidates)
 func (c *Client) onMessage(msg *MessageMessage) {
-	c.logger.Debug("received signaling message", "from", msg.From, "type", msg.Data)
+	senderID := ""
+	if msg.Message.Sender != nil {
+		senderID = msg.Message.Sender.SessionID
+	}
+	c.logger.Debug("received signaling message", "from", senderID, "data", msg.Message.Data)
 
-	// Send copy to message channel
-	c.msgChan <- msg
+	select {
+	case c.msgChan <- msg:
+	case <-c.ctx.Done():
+	default:
+		c.logger.Warn("HPB message channel full, dropping signaling message")
+	}
 }
 
 // onBye handles bye message (participant leaving or room closing)
 func (c *Client) onBye(msg *ByeMessage) {
 	c.logger.Info("received bye", "sessionID", msg.SessionID, "reason", msg.Reason)
 
-	// Send copy to message channel
-	c.msgChan <- msg
+	select {
+	case c.msgChan <- msg:
+	case <-c.ctx.Done():
+	default:
+		c.logger.Warn("HPB message channel full, dropping bye message")
+	}
 }
 
 // SendMessage sends a message to HPB (plain JSON)
@@ -378,22 +492,123 @@ func (c *Client) SendMessage(msg interface{}) error {
 		return err
 	}
 
+	c.logger.Debug("HPB outgoing message", "json", string(data))
+
 	return c.conn.WriteMessage(websocket.TextMessage, data)
 }
 
-// JoinRoom sends incall message to join a room
+// JoinRoom sends a room join message to HPB signaling
 func (c *Client) JoinRoom(roomToken string) error {
-	msg := InternalMessage{
-		Type: "internal",
+	msg := RoomJoinRequest{
+		Type: "room",
 		ID:   c.nextMsgID(),
-		Internal: InternalInner{
-			Type: "incall",
-			InCall: &InCallData{
-				InCall: CallFlagInCall,
+		Room: RoomJoinInner{
+			RoomID:    roomToken,
+			SessionID: "", // Not needed for internal auth
+		},
+	}
+	c.logger.Debug("joining room via HPB", "roomToken", roomToken)
+	return c.SendMessage(msg)
+}
+
+// SendTranscript sends a transcript message to a specific session via HPB
+func (c *Client) SendTranscript(recipientSessionID, text, langID, speakerSessionID string, final bool) error {
+	msg := MessageMessage{
+		Type: "message",
+		ID:   c.nextMsgID(),
+		Message: MessageEnvelope{
+			Recipient: &MessageRecipient{
+				Type:      "session",
+				SessionID: recipientSessionID,
+			},
+			Data: map[string]interface{}{
+				"type":             "transcript",
+				"message":          text,
+				"langId":           langID,
+				"speakerSessionId": speakerSessionID,
+				"final":            final,
 			},
 		},
 	}
 	return c.SendMessage(msg)
+}
+
+// SendRoomMessage sends a message to all participants in a room via the HPB backend API.
+// This uses HTTP POST to the signaling server's backend endpoint, which broadcasts
+// the message to all connected clients in the room.
+func (c *Client) SendRoomMessage(roomToken string, data map[string]interface{}) error {
+	// Build the HTTP API URL from the WebSocket URL (strip path, keep origin)
+	apiURL := c.hpbURL
+	apiURL = strings.Replace(apiURL, "wss://", "https://", 1)
+	apiURL = strings.Replace(apiURL, "ws://", "http://", 1)
+	// Strip path after host:port (e.g., /spreed) - API is at the root
+	if idx := strings.Index(apiURL[8:], "/"); idx > 0 {
+		apiURL = apiURL[:8+idx]
+	}
+	apiURL = strings.TrimRight(apiURL, "/")
+	apiURL += "/api/v1/room/" + roomToken
+
+	// Build request body
+	body := map[string]interface{}{
+		"type": "message",
+		"message": map[string]interface{}{
+			"data": data,
+		},
+	}
+
+	bodyJSON, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("failed to marshal room message: %w", err)
+	}
+
+	// Generate HMAC-SHA256 signature (same as BackendNotifier in Talk PHP)
+	// Uses the signaling backend secret, NOT the internal client secret
+	random := generateNonce() // 64 hex chars
+	mac := hmac.New(sha256.New, []byte(c.signalingSecret))
+	mac.Write([]byte(random))
+	mac.Write(bodyJSON)
+	checksum := hex.EncodeToString(mac.Sum(nil))
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", apiURL, bytes.NewReader(bodyJSON))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Spreed-Signaling-Random", random)
+	req.Header.Set("Spreed-Signaling-Checksum", checksum)
+	req.Header.Set("Spreed-Signaling-Backend", c.backendURL)
+
+	c.logger.Debug("sending room message via backend API", "url", apiURL, "body", string(bodyJSON))
+
+	// Send request
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("backend API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("backend API returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	c.logger.Debug("backend API response", "status", resp.StatusCode, "body", string(respBody))
+	return nil
+}
+
+// SendTranscriptViaBackend sends a transcript message to all room participants via the HPB backend API
+func (c *Client) SendTranscriptViaBackend(roomToken, text, langID, speakerSessionID string, final bool) error {
+	data := map[string]interface{}{
+		"type":             "transcript",
+		"message":          text,
+		"langId":           langID,
+		"speakerSessionId": speakerSessionID,
+		"final":            final,
+	}
+	return c.SendRoomMessage(roomToken, data)
 }
 
 // MessageChan returns the channel for receiving HPB messages

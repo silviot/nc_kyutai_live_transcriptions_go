@@ -159,6 +159,133 @@ func TestChunkBufferFlush(t *testing.T) {
 	}
 }
 
+func TestResamplingPreservesAmplitude(t *testing.T) {
+	// Test that resampling a sine wave preserves amplitude in [-1, 1]
+	resampler, _ := NewResampler(48000, 24000, slog.Default())
+
+	// Generate 48kHz sine wave at 440Hz, 100ms
+	input := make([]float32, 4800)
+	for i := range input {
+		// 440Hz sine wave
+		phase := float64(i) / 48000.0 * 440.0 * 2 * 3.14159265
+		input[i] = float32(0.8 * sinApprox(phase))
+	}
+
+	output, err := resampler.Resample(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, v := range output {
+		if v > 1.0 || v < -1.0 {
+			t.Errorf("sample %d out of range: %f", i, v)
+		}
+	}
+}
+
+func TestResamplingManyFramesNoAmplification(t *testing.T) {
+	// Simulate what happens in the real pipeline: many small frames through resampler
+	resampler, _ := NewResampler(48000, 24000, slog.Default())
+	cb := NewChunkBuffer(24000, 80, slog.Default()) // 80ms chunks = 1920 samples
+
+	// Process 1000 frames of 120 samples each (like real Opus output)
+	for frame := 0; frame < 1000; frame++ {
+		input := make([]float32, 120) // 2.5ms at 48kHz
+		for i := range input {
+			// Simulate speech-like audio: sine with varying amplitude
+			phase := float64(frame*120+i) / 48000.0 * 300.0 * 2 * 3.14159265
+			input[i] = float32(0.3 * sinApprox(phase))
+		}
+
+		output, err := resampler.Resample(input)
+		if err != nil {
+			t.Fatalf("frame %d: resample failed: %v", frame, err)
+		}
+
+		// Check resampled values
+		for i, v := range output {
+			if v > 1.0 || v < -1.0 {
+				t.Errorf("frame %d, sample %d: resampled value out of range: %f", frame, i, v)
+				return
+			}
+		}
+
+		// Feed through chunk buffer
+		chunks := cb.Add(output)
+		for _, chunk := range chunks {
+			for i, v := range chunk {
+				if v > 1.0 || v < -1.0 {
+					t.Errorf("frame %d, chunk sample %d: value out of range: %f", frame, i, v)
+					return
+				}
+			}
+		}
+	}
+}
+
+func TestProcessFrameAmplitude(t *testing.T) {
+	// Test the full Pipeline.ProcessFrame path
+	p, _ := NewPipeline(48000, 24000, slog.Default())
+	defer p.Close()
+
+	var maxSeen float32
+	for frame := 0; frame < 500; frame++ {
+		input := make([]float32, 480) // 10ms at 48kHz
+		for i := range input {
+			phase := float64(frame*480+i) / 48000.0 * 440.0 * 2 * 3.14159265
+			input[i] = float32(0.9 * sinApprox(phase))
+		}
+
+		output, err := p.ProcessFrame(input)
+		if err != nil {
+			t.Fatalf("frame %d: %v", frame, err)
+		}
+
+		for _, v := range output {
+			if v > maxSeen {
+				maxSeen = v
+			}
+			if -v > maxSeen {
+				maxSeen = -v
+			}
+			if v > 1.0 || v < -1.0 {
+				t.Errorf("frame %d: value out of range: %f (max seen: %f)", frame, v, maxSeen)
+				return
+			}
+		}
+	}
+	t.Logf("max absolute value seen across 500 frames: %f", maxSeen)
+}
+
+func sinApprox(x float64) float64 {
+	// Use math-free sine approximation for test (avoid importing math in test)
+	// Normalize to [0, 2*pi)
+	const twoPi = 6.28318530718
+	for x < 0 {
+		x += twoPi
+	}
+	for x >= twoPi {
+		x -= twoPi
+	}
+	// Bhaskara I approximation
+	if x > 3.14159265 {
+		x -= 3.14159265
+		return -sinApprox0ToPi(x)
+	}
+	return sinApprox0ToPi(x)
+}
+
+func sinApprox0ToPi(x float64) float64 {
+	// 16x(pi-x) / (5pi^2 - 4x(pi-x)) for x in [0, pi]
+	const pi = 3.14159265
+	num := 16 * x * (pi - x)
+	den := 5*pi*pi - 4*x*(pi-x)
+	if den == 0 {
+		return 0
+	}
+	return num / den
+}
+
 func abs(x float32) float32 {
 	if x < 0 {
 		return -x

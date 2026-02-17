@@ -7,10 +7,13 @@ import (
 	"github.com/silviot/nc_kyutai_live_transcriptions_go/pkg/webrtc"
 )
 
-// TranscribeRequest is the incoming request to start transcription
+// TranscribeRequest matches the Nextcloud Talk ExApp transcription request format.
 type TranscribeRequest struct {
-	RoomToken  string `json:"roomToken"`
-	LanguageID string `json:"languageId"`
+	RoomToken   string              `json:"roomToken"`
+	NcSessionID string              `json:"ncSessionId"`
+	Enable      *bool               `json:"enable,omitempty"`   // nil defaults to true
+	LangID      string              `json:"langId"`             // Nextcloud uses langId
+	LanguageID  string              `json:"languageId"`         // Also accept languageId
 	TURNServers []TURNServerRequest `json:"turnServers,omitempty"`
 }
 
@@ -21,22 +24,9 @@ type TURNServerRequest struct {
 	Credential string   `json:"credential,omitempty"`
 }
 
-// TranscribeResponse is the response after starting transcription
-type TranscribeResponse struct {
-	Status    string `json:"status"`
-	RoomToken string `json:"roomToken"`
-	Message   string `json:"message,omitempty"`
-}
-
 // HandleTranscribeRequest handles POST /api/v1/call/transcribe
 func (m *Manager) HandleTranscribeRequest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
-		return
-	}
 
 	var req TranscribeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -52,15 +42,39 @@ func (m *Manager) HandleTranscribeRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if req.LanguageID == "" {
-		req.LanguageID = "en"
+	// Resolve language (prefer langId, fall back to languageId)
+	langID := req.LangID
+	if langID == "" {
+		langID = req.LanguageID
+	}
+	if langID == "" {
+		langID = "en"
+	}
+
+	// Check enable flag (defaults to true if absent)
+	enable := true
+	if req.Enable != nil {
+		enable = *req.Enable
+	}
+
+	// If disabling, leave the room
+	if !enable {
+		if err := m.LeaveRoom(req.RoomToken); err != nil {
+			m.logger.Error("failed to leave room", "roomToken", req.RoomToken, "error", err)
+			// Not an error if room not found (already left)
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "ok",
+			"enabled":  false,
+			"language": langID,
+		})
+		return
 	}
 
 	// Validate language support
-	if req.LanguageID != "en" && req.LanguageID != "fr" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "unsupported language"})
-		return
+	if langID != "en" && langID != "fr" {
+		m.logger.Warn("unsupported language requested, using default", "requested", langID)
+		langID = "en"
 	}
 
 	// Convert TURN servers
@@ -74,7 +88,7 @@ func (m *Manager) HandleTranscribeRequest(w http.ResponseWriter, r *http.Request
 	}
 
 	// Join room
-	_, err := m.JoinRoom(r.Context(), req.RoomToken, req.LanguageID, turnServers)
+	_, err := m.JoinRoom(r.Context(), req.RoomToken, langID, turnServers)
 	if err != nil {
 		m.logger.Error("failed to join room", "roomToken", req.RoomToken, "error", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -82,11 +96,10 @@ func (m *Manager) HandleTranscribeRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(TranscribeResponse{
-		Status:    "started",
-		RoomToken: req.RoomToken,
-		Message:   "transcription started",
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":   "ok",
+		"enabled":  true,
+		"language": langID,
 	})
 }
 
@@ -114,4 +127,3 @@ func (m *Manager) HandleStopTranscriptionRequest(w http.ResponseWriter, r *http.
 		"roomToken": roomToken,
 	})
 }
-

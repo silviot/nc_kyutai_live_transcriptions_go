@@ -50,6 +50,45 @@ This runs `scripts/test-live.sh` which:
 4. Attempts to join the test room
 5. Reports status
 
+### Comprehensive E2E Test Tool
+
+The E2E test tool (`tools/e2e/main.go`) performs a comprehensive end-to-end test:
+
+```bash
+# Basic E2E test (30 seconds, test tone audio)
+./scripts/run-e2e.sh --duration 30 --verbose
+
+# E2E test with real audio file
+./scripts/run-e2e.sh --duration 30 --audio-file ../kyutai_modal/test_audio.wav --verbose
+
+# Full options
+go run ./tools/e2e/main.go \
+    --room-url "https://cloud.codemyriad.io/call/erwcr27x" \
+    --duration 30 \
+    --audio-file /path/to/speech.wav \
+    --language en \
+    --guest-name "Test Bot" \
+    --enable-transcription \
+    --verbose
+```
+
+**What the E2E test does:**
+
+1. **OCS API Integration**: Joins room as guest, sets display name
+2. **Signaling Settings**: Gets STUN/TURN servers from Nextcloud
+3. **Call Join**: Joins the audio/video call via OCS API
+4. **HPB Connection**: Connects to HPB signaling with internal auth
+5. **Live Transcription**: Enables live transcription via OCS API
+6. **Modal Connection**: Connects to Modal STT service
+7. **Audio Streaming**: Sends test audio (tone or WAV file) to Modal
+8. **Transcript Reception**: Receives and displays transcripts
+
+**Test Results:**
+- [PASS] HPB connection established
+- [PASS] Modal connection established
+- [PASS] Audio sent to Modal
+- [PASS/WARN] Transcripts received (depends on audio content)
+
 ### Manual E2E Test
 
 1. **Start the service**:
@@ -104,7 +143,9 @@ To verify identical behavior:
    - Connection stability
    - Error handling
 
-## Nextcloud AIO SSH Access
+## Deployment
+
+### SSH Access
 
 The Nextcloud instance is accessible via SSH:
 
@@ -112,7 +153,23 @@ The Nextcloud instance is accessible via SSH:
 ssh cloud.codemyriad.io
 ```
 
-Useful commands:
+### Installing/Reinstalling the App
+
+Use `docker exec` to run `php occ` commands for managing the transcription app:
+
+```bash
+ssh cloud.codemyriad.io
+
+# Uninstall the app
+sudo docker exec -it nextcloud-aio-nextcloud php occ app:disable nc_kyutai_live_transcriptions
+sudo docker exec -it nextcloud-aio-nextcloud php occ app:remove nc_kyutai_live_transcriptions
+
+# Reinstall the app
+sudo docker exec -it nextcloud-aio-nextcloud php occ app:install nc_kyutai_live_transcriptions
+sudo docker exec -it nextcloud-aio-nextcloud php occ app:enable nc_kyutai_live_transcriptions
+```
+
+### Useful AIO Commands
 
 ```bash
 # View AIO container logs

@@ -13,19 +13,24 @@ import (
 // run executes the transcriber main loop
 func (t *Transcriber) run(hpbClient *hpb.Client, roomToken string, logger *slog.Logger) {
 	defer t.wg.Done()
-
-	// Connect Modal
-	if err := t.modalClient.Connect(t.ctx); err != nil {
-		logger.Error("failed to connect to Modal", "sessionID", t.sessionID, "error", err)
-		return
-	}
 	defer t.modalClient.Close()
 
-	// Start audio processing goroutine
+	// Start audio processing goroutine immediately (don't wait for Modal)
 	t.wg.Add(1)
 	go t.processAudioLoop(logger)
 
+	// Connect Modal in the background (can take 30+ seconds for cold start)
+	modalReady := make(chan struct{})
+	go func() {
+		if err := t.modalClient.Connect(t.ctx); err != nil {
+			logger.Error("failed to connect to Modal", "sessionID", t.sessionID, "error", err)
+			return
+		}
+		close(modalReady)
+	}()
+
 	// Process transcripts and handle reconnection
+	audioChunkCount := 0
 	modalConnectAttempts := 0
 	maxAttempts := 5
 	backoffBase := 2
@@ -65,18 +70,51 @@ func (t *Transcriber) run(hpbClient *hpb.Client, roomToken string, logger *slog.
 		// Send processed audio chunks to Modal
 		case chunk := <-t.audioOutCh:
 			if len(chunk) > 0 {
+				if !t.modalClient.IsConnected() {
+					// Drop audio until Modal is ready
+					continue
+				}
+
+				// Log audio level periodically for debugging
+				audioChunkCount++
+				if audioChunkCount%100 == 1 {
+					var sumSq float64
+					var peak float32
+					for _, s := range chunk {
+						sumSq += float64(s) * float64(s)
+						if s > peak {
+							peak = s
+						} else if -s > peak {
+							peak = -s
+						}
+					}
+					rms := math.Sqrt(sumSq / float64(len(chunk)))
+					var rmsDB float64
+					if rms > 0 {
+						rmsDB = 20 * math.Log10(rms)
+					} else {
+						rmsDB = -999
+					}
+					logger.Info("audio level to Modal", "sessionID", t.sessionID,
+						"rmsDB", fmt.Sprintf("%.1f", rmsDB), "peak", fmt.Sprintf("%.4f", peak),
+						"samples", len(chunk), "chunkNum", audioChunkCount)
+				}
+
 				if err := t.modalClient.SendAudio(chunk); err != nil {
 					logger.Debug("failed to send audio to Modal", "sessionID", t.sessionID, "error", err)
+				} else if audioChunkCount <= 5 {
+					logger.Debug("audio chunk sent to Modal", "sessionID", t.sessionID, "samples", len(chunk))
 				}
 			}
 		}
 	}
 }
 
-// processAudioLoop reads raw audio frames, processes them, and outputs chunks
+// processAudioLoop reads decoded float32 PCM frames, resamples, and outputs chunks
 func (t *Transcriber) processAudioLoop(logger *slog.Logger) {
 	defer t.wg.Done()
 
+	frameCount := 0
 	for {
 		select {
 		case <-t.ctx.Done():
@@ -87,17 +125,19 @@ func (t *Transcriber) processAudioLoop(logger *slog.Logger) {
 				continue
 			}
 
-			// Convert int16 to float32
-			float32Frame := int16ToFloat32(frame)
+			frameCount++
+			if frameCount%500 == 1 {
+				logger.Debug("processing audio frame", "sessionID", t.sessionID, "samples", len(frame), "frameCount", frameCount)
+			}
 
 			// Resample if needed (48kHz → 24kHz)
-			resampled, err := t.audioPipe.ProcessFrame(float32Frame)
+			resampled, err := t.audioPipe.ProcessFrame(frame)
 			if err != nil {
 				logger.Debug("resample error", "sessionID", t.sessionID, "error", err)
 				continue
 			}
 
-			// Buffer into 200ms chunks
+			// Buffer into 80ms chunks (matching Modal Rust server expectations)
 			chunks := t.audioCache.Add(resampled)
 			for _, chunk := range chunks {
 				select {
@@ -113,43 +153,21 @@ func (t *Transcriber) processAudioLoop(logger *slog.Logger) {
 	}
 }
 
-// int16ToFloat32 converts int16 PCM samples to float32 [-1.0, 1.0]
-func int16ToFloat32(samples []int16) []float32 {
-	result := make([]float32, len(samples))
-	for i, sample := range samples {
-		result[i] = float32(sample) / 32768.0
-	}
-	return result
-}
-
 // handleTranscript processes a transcript from Modal and sends to HPB
 func (t *Transcriber) handleTranscript(hpbClient *hpb.Client, roomToken string, transcript modal.Transcript, logger *slog.Logger) {
 	if transcript.Text == "" {
 		return
 	}
 
-	logger.Debug("transcript received", "sessionID", t.sessionID, "text", transcript.Text, "final", transcript.Final)
+	logger.Info("transcript received", "sessionID", t.sessionID, "text", transcript.Text, "final", transcript.Final)
 
-	// Send to HPB as closed caption message
-	msg := hpb.MessageMessage{
-		Type:      "message",
-		To:        "", // Broadcast to room
-		RoomToken: roomToken,
-		Data: map[string]interface{}{
-			"type":  "transcription",
-			"from":  t.sessionID,
-			"text":  transcript.Text,
-			"final": transcript.Final,
-		},
-	}
-
-	if err := hpbClient.SendMessage(msg); err != nil {
-		logger.Error("failed to send transcript to HPB", "sessionID", t.sessionID, "error", err)
+	if t.broadcast != nil {
+		t.broadcast(transcript.Text, transcript.Final)
 	}
 }
 
-// AddAudioFrame adds a raw audio frame from WebRTC to the processing queue
-func (t *Transcriber) AddAudioFrame(frame []int16) error {
+// AddAudioFrame adds a decoded float32 PCM frame to the processing queue
+func (t *Transcriber) AddAudioFrame(frame []float32) error {
 	if t.ctx.Err() != nil {
 		return fmt.Errorf("transcriber context cancelled")
 	}

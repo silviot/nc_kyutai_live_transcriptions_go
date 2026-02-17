@@ -2,7 +2,6 @@ package modal
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -16,9 +15,11 @@ import (
 
 // Transcript represents a transcript result from Modal STT
 type Transcript struct {
-	Text   string `json:"text"`
-	Final  bool   `json:"final"`
-	VADEnd bool   `json:"vad_end"`
+	Type    string `json:"type"`    // "token", "vad_end", "error"
+	Text    string `json:"text"`    // Token text (for type="token")
+	Message string `json:"message"` // Error message (for type="error")
+	Final   bool   `json:"final"`   // Computed: true if vad_end
+	VADEnd  bool   `json:"vad_end"` // True if this is a vad_end marker
 }
 
 // Client manages WebSocket connection to Modal STT service
@@ -75,24 +76,39 @@ func (c *Client) Connect(ctx context.Context) error {
 	// Build WebSocket URL
 	wsURL := fmt.Sprintf("wss://%s--kyutai-stt-rust-kyutaisttrustservice-serve.modal.run/v1/stream", c.workspace)
 
-	// Create basic auth header
-	auth := c.key + ":" + c.secret
-	encodedAuth := base64.StdEncoding.EncodeToString([]byte(auth))
-
-	// Prepare headers with authentication
+	// Prepare headers with Modal authentication (not Basic auth)
 	headers := map[string][]string{
-		"Authorization": {"Basic " + encodedAuth},
+		"Modal-Key":    {c.key},
+		"Modal-Secret": {c.secret},
 	}
 
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
+		HandshakeTimeout: 60 * time.Second, // Modal cold start can take time
 	}
 
+	c.logger.Info("connecting to Modal", "url", wsURL)
 	conn, _, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		c.logger.Error("failed to connect to Modal", "workspace", c.workspace, "error", err)
 		return err
 	}
+
+	// Set up ping handler that uses WriteControl (safe for concurrent use)
+	// instead of the default handler which uses WriteMessage (NOT safe).
+	// Without this, the pong response conflicts with SendAudio writes,
+	// causing the server to close the connection.
+	conn.SetPingHandler(func(appData string) error {
+		c.logger.Debug("Modal ping received, sending pong")
+		err := conn.WriteControl(
+			websocket.PongMessage,
+			[]byte(appData),
+			time.Now().Add(10*time.Second),
+		)
+		if err != nil {
+			c.logger.Debug("pong write error", "error", err)
+		}
+		return err
+	})
 
 	c.conn = conn
 	c.connected = true
@@ -121,12 +137,13 @@ func (c *Client) readLoop() {
 			continue
 		}
 
-		c.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		c.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		messageType, data, err := c.conn.ReadMessage()
 		if err != nil {
-			if !isPeerClosedError(err) {
-				c.logger.Error("Modal read error", "error", err)
-				c.errCh <- err
+			c.logger.Error("Modal read error", "error", err)
+			select {
+			case c.errCh <- err:
+			default:
 			}
 			c.mu.Lock()
 			c.connected = false
@@ -134,26 +151,64 @@ func (c *Client) readLoop() {
 			return
 		}
 
+		c.logger.Debug("Modal message received", "type", messageType, "len", len(data))
+
 		// Handle text messages (JSON transcripts)
 		if messageType == websocket.TextMessage {
-			var transcript Transcript
-			if err := json.Unmarshal(data, &transcript); err != nil {
-				c.logger.Error("failed to parse transcript", "error", err, "data", string(data))
+			var msg map[string]interface{}
+			if err := json.Unmarshal(data, &msg); err != nil {
+				c.logger.Error("failed to parse Modal message", "error", err, "data", string(data))
 				continue
 			}
 
-			select {
-			case c.transcriptCh <- transcript:
-			case <-c.ctx.Done():
-				return
+			msgType, _ := msg["type"].(string)
+			switch msgType {
+			case "token":
+				text, _ := msg["text"].(string)
+				transcript := Transcript{
+					Type:   "token",
+					Text:   text,
+					Final:  false,
+					VADEnd: false,
+				}
+				select {
+				case c.transcriptCh <- transcript:
+				case <-c.ctx.Done():
+					return
+				default:
+					c.logger.Warn("transcript channel full, dropping result")
+				}
+
+			case "vad_end":
+				transcript := Transcript{
+					Type:   "vad_end",
+					Final:  true,
+					VADEnd: true,
+				}
+				select {
+				case c.transcriptCh <- transcript:
+				case <-c.ctx.Done():
+					return
+				default:
+					c.logger.Warn("transcript channel full, dropping result")
+				}
+
+			case "error":
+				errMsg, _ := msg["message"].(string)
+				c.logger.Error("Modal error", "message", errMsg)
+				select {
+				case c.errCh <- fmt.Errorf("modal error: %s", errMsg):
+				default:
+				}
+
 			default:
-				c.logger.Warn("transcript channel full, dropping result")
+				c.logger.Debug("unknown Modal message type", "type", msgType, "data", string(data))
 			}
 		}
 	}
 }
 
-// SendAudio sends audio data to Modal STT service
+// SendAudio sends audio data to Modal STT service as float32 (little-endian)
 func (c *Client) SendAudio(audioData []float32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -162,8 +217,8 @@ func (c *Client) SendAudio(audioData []float32) error {
 		return fmt.Errorf("not connected to Modal")
 	}
 
-	// Convert float32 to binary frame
-	// Format: 4 bytes per sample (float32 little-endian)
+	// Convert float32 to binary frame (4 bytes per sample, float32 little-endian)
+	// Modal Rust proxy expects float32 audio at 24kHz
 	binaryData := make([]byte, len(audioData)*4)
 	for i, sample := range audioData {
 		bits := math.Float32bits(sample)

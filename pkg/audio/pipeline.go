@@ -244,6 +244,8 @@ func NewChunkBuffer(sampleRate, chunkDurationMs int, logger *slog.Logger) *Chunk
 	// chunkDurationMs=200, sampleRate=24000 → 4800 samples
 	chunkSize := (sampleRate * chunkDurationMs) / 1000
 
+	logger.Info("ChunkBuffer created", "sampleRate", sampleRate, "chunkDurationMs", chunkDurationMs, "chunkSize", chunkSize)
+
 	return &ChunkBuffer{
 		chunkSize: chunkSize,
 		buffer:    make([]float32, 0, chunkSize),
