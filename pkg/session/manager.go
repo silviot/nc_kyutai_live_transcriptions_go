@@ -32,6 +32,7 @@ type Transcriber struct {
 	audioInputCh chan []float32 // Decoded float32 PCM from WebRTC (48kHz)
 	audioOutCh   chan []float32 // Processed audio chunks for Modal (24kHz)
 	broadcast    func(text string, final bool) // Callback to broadcast transcript to room participants
+	pendingText  string                       // Accumulated tokens for current utterance
 	mu           sync.Mutex
 	ctx          context.Context
 	cancel       context.CancelFunc

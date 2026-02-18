@@ -153,16 +153,34 @@ func (t *Transcriber) processAudioLoop(logger *slog.Logger) {
 	}
 }
 
-// handleTranscript processes a transcript from Modal and sends to HPB
+// handleTranscript processes a transcript from Modal and sends to HPB.
+// Tokens are accumulated into a buffer and sent as the growing utterance text.
+// On vad_end (Final=true), the accumulated text is sent with final=true and
+// the buffer is reset for the next utterance.
 func (t *Transcriber) handleTranscript(hpbClient *hpb.Client, roomToken string, transcript modal.Transcript, logger *slog.Logger) {
+	if transcript.Final {
+		// VAD end: finalize the current utterance
+		if t.pendingText != "" {
+			logger.Info("transcript finalized", "sessionID", t.sessionID, "text", t.pendingText)
+			if t.broadcast != nil {
+				t.broadcast(t.pendingText, true)
+			}
+			t.pendingText = ""
+		}
+		return
+	}
+
 	if transcript.Text == "" {
 		return
 	}
 
-	logger.Info("transcript received", "sessionID", t.sessionID, "text", transcript.Text, "final", transcript.Final)
+	// Accumulate token into pending utterance
+	t.pendingText += transcript.Text
+
+	logger.Info("transcript token", "sessionID", t.sessionID, "token", transcript.Text, "accumulated", t.pendingText)
 
 	if t.broadcast != nil {
-		t.broadcast(transcript.Text, transcript.Final)
+		t.broadcast(t.pendingText, false)
 	}
 }
 
