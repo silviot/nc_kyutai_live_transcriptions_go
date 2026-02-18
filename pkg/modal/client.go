@@ -261,10 +261,9 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// isPeerClosedError checks if error is due to peer closing connection
-func isPeerClosedError(err error) bool {
-	// Check for websocket closure or context cancellation
-	return err == websocket.ErrCloseSent ||
-		err.Error() == "websocket: close sent" ||
-		err.Error() == "websocket: connection reset by peer"
+// IsNormalClose returns true if the error represents a normal WebSocket close (code 1000).
+// This indicates the server intentionally closed the connection (e.g. idle timeout)
+// and the client should NOT attempt reconnection.
+func IsNormalClose(err error) bool {
+	return websocket.IsCloseError(err, websocket.CloseNormalClosure)
 }

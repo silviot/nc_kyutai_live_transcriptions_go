@@ -36,11 +36,19 @@ func (t *Transcriber) run(hpbClient *hpb.Client, roomToken string, logger *slog.
 	backoffBase := 2
 	backoffMultiplier := 1.0
 
+	// Ticker to flush throttled broadcasts
+	flushTicker := time.NewTicker(broadcastMinInterval)
+	defer flushTicker.Stop()
+
 	for {
 		select {
 		case <-t.ctx.Done():
 			logger.Debug("transcriber shutting down", "sessionID", t.sessionID)
 			return
+
+		// Flush any throttled broadcast text
+		case <-flushTicker.C:
+			t.flushPendingBroadcast(logger)
 
 		// Handle transcript results from Modal
 		case transcript := <-t.modalClient.TranscriptChan():
@@ -49,6 +57,16 @@ func (t *Transcriber) run(hpbClient *hpb.Client, roomToken string, logger *slog.
 		// Handle errors from Modal
 		case err := <-t.modalClient.ErrorChan():
 			logger.Warn("Modal error", "sessionID", t.sessionID, "error", err)
+
+			// Don't reconnect on normal close (code 1000). This means the server
+			// intentionally closed the connection (e.g. idle timeout because no
+			// audio was being sent). Reconnecting would just create another idle
+			// connection that gets closed again, wasting resources.
+			if modal.IsNormalClose(err) {
+				logger.Info("Modal connection closed normally (idle timeout), not reconnecting", "sessionID", t.sessionID)
+				continue
+			}
+
 			if !t.modalClient.IsConnected() {
 				// Try to reconnect
 				if modalConnectAttempts < maxAttempts {
@@ -153,10 +171,16 @@ func (t *Transcriber) processAudioLoop(logger *slog.Logger) {
 	}
 }
 
+// broadcastMinInterval is the minimum time between non-final broadcast sends
+// per speaker to avoid overwhelming the signaling server's rate limits.
+// With multiple speakers, the effective total rate is N * (1/interval).
+const broadcastMinInterval = 2 * time.Second
+
 // handleTranscript processes a transcript from Modal and sends to HPB.
 // Tokens are accumulated into a buffer and sent as the growing utterance text.
 // On vad_end (Final=true), the accumulated text is sent with final=true and
 // the buffer is reset for the next utterance.
+// Non-final broadcasts are throttled to at most one per broadcastMinInterval.
 func (t *Transcriber) handleTranscript(hpbClient *hpb.Client, roomToken string, transcript modal.Transcript, logger *slog.Logger) {
 	if transcript.Final {
 		// VAD end: finalize the current utterance
@@ -164,8 +188,10 @@ func (t *Transcriber) handleTranscript(hpbClient *hpb.Client, roomToken string, 
 			logger.Info("transcript finalized", "sessionID", t.sessionID, "text", t.pendingText)
 			if t.broadcast != nil {
 				t.broadcast(t.pendingText, true)
+				t.lastBroadcast = time.Now()
 			}
 			t.pendingText = ""
+			t.broadcastDirty = false
 		}
 		return
 	}
@@ -176,11 +202,28 @@ func (t *Transcriber) handleTranscript(hpbClient *hpb.Client, roomToken string, 
 
 	// Accumulate token into pending utterance
 	t.pendingText += transcript.Text
+	t.broadcastDirty = true
 
 	logger.Info("transcript token", "sessionID", t.sessionID, "token", transcript.Text, "accumulated", t.pendingText)
 
 	if t.broadcast != nil {
+		now := time.Now()
+		if now.Sub(t.lastBroadcast) >= broadcastMinInterval {
+			t.broadcast(t.pendingText, false)
+			t.lastBroadcast = now
+			t.broadcastDirty = false
+		}
+	}
+}
+
+// flushPendingBroadcast sends any accumulated but unsent transcript text.
+// Called periodically from the main transcriber loop to ensure text isn't
+// left unsent when tokens arrive slower than the throttle interval.
+func (t *Transcriber) flushPendingBroadcast(logger *slog.Logger) {
+	if t.broadcastDirty && t.broadcast != nil && t.pendingText != "" {
 		t.broadcast(t.pendingText, false)
+		t.lastBroadcast = time.Now()
+		t.broadcastDirty = false
 	}
 }
 

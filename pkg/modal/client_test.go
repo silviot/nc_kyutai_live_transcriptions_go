@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -368,5 +369,80 @@ func TestModalConnectFailure(t *testing.T) {
 	err := client.Connect(ctx)
 	if err == nil {
 		t.Error("expected connection error for invalid Modal URL")
+	}
+}
+
+func TestIsNormalClose(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "normal close 1000",
+			err:      &websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "normal"},
+			expected: true,
+		},
+		{
+			name:     "abnormal close 1006",
+			err:      &websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "abnormal"},
+			expected: false,
+		},
+		{
+			name:     "going away 1001",
+			err:      &websocket.CloseError{Code: websocket.CloseGoingAway, Text: "going away"},
+			expected: false,
+		},
+		{
+			name:     "generic error",
+			err:      fmt.Errorf("some random error"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsNormalClose(tt.err)
+			if got != tt.expected {
+				t.Errorf("IsNormalClose(%v) = %v, want %v", tt.err, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestModalNormalCloseOnErrorChan(t *testing.T) {
+	// Verify that when the server sends a normal close (1000),
+	// the error appears on ErrorChan and IsNormalClose returns true.
+	mock := newMockModalServer()
+	defer mock.close()
+
+	client := NewClient(Config{Workspace: "test", Key: "k", Secret: "s"})
+	defer client.Close()
+
+	if err := connectToMock(client, mock.wsURL()); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Server sends normal close frame
+	mock.mu.Lock()
+	conn := mock.conn
+	mock.mu.Unlock()
+	conn.WriteMessage(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "idle timeout"))
+
+	select {
+	case err := <-client.ErrorChan():
+		if !IsNormalClose(err) {
+			t.Errorf("expected IsNormalClose=true for error %q", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for close error on ErrorChan")
+	}
+
+	// Client should be disconnected
+	if client.IsConnected() {
+		t.Error("expected disconnected after normal close")
 	}
 }

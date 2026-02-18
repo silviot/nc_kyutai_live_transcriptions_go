@@ -3,6 +3,7 @@ package session
 import (
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/silviot/nc_kyutai_live_transcriptions_go/pkg/modal"
 )
@@ -30,28 +31,41 @@ func TestHandleTranscript_TokenAccumulation(t *testing.T) {
 
 	logger := slog.Default()
 
-	// Feed multiple tokens
+	// Feed multiple tokens rapidly (within broadcastMinInterval)
 	tr.handleTranscript(nil, "room1", modal.Transcript{Type: "token", Text: "Hello"}, logger)
 	tr.handleTranscript(nil, "room1", modal.Transcript{Type: "token", Text: " world"}, logger)
 	tr.handleTranscript(nil, "room1", modal.Transcript{Type: "token", Text: "!"}, logger)
 
-	// pendingText should accumulate
+	// pendingText should accumulate all tokens
 	if tr.pendingText != "Hello world!" {
 		t.Errorf("pendingText = %q, want %q", tr.pendingText, "Hello world!")
 	}
 
-	// Each token should trigger a broadcast with accumulated text, final=false
-	if len(broadcasts) != 3 {
-		t.Fatalf("expected 3 broadcasts, got %d", len(broadcasts))
+	// First token broadcasts immediately (lastBroadcast is zero),
+	// subsequent tokens within 2s are throttled
+	if len(broadcasts) != 1 {
+		t.Fatalf("expected 1 broadcast (first token, rest throttled), got %d", len(broadcasts))
 	}
 	if broadcasts[0].text != "Hello" || broadcasts[0].final != false {
 		t.Errorf("broadcast[0] = (%q, %v), want (Hello, false)", broadcasts[0].text, broadcasts[0].final)
 	}
-	if broadcasts[1].text != "Hello world" || broadcasts[1].final != false {
-		t.Errorf("broadcast[1] = (%q, %v), want (Hello world, false)", broadcasts[1].text, broadcasts[1].final)
+
+	// broadcastDirty should be true (unsent accumulated text)
+	if !tr.broadcastDirty {
+		t.Error("expected broadcastDirty=true after throttled tokens")
 	}
-	if broadcasts[2].text != "Hello world!" || broadcasts[2].final != false {
-		t.Errorf("broadcast[2] = (%q, %v), want (Hello world!, false)", broadcasts[2].text, broadcasts[2].final)
+
+	// flushPendingBroadcast sends the accumulated text (it doesn't check throttle)
+	tr.flushPendingBroadcast(logger)
+
+	if len(broadcasts) != 2 {
+		t.Fatalf("expected 2 broadcasts after flush, got %d", len(broadcasts))
+	}
+	if broadcasts[1].text != "Hello world!" || broadcasts[1].final != false {
+		t.Errorf("broadcast[1] = (%q, %v), want (Hello world!, false)", broadcasts[1].text, broadcasts[1].final)
+	}
+	if tr.broadcastDirty {
+		t.Error("expected broadcastDirty=false after flush")
 	}
 }
 
@@ -80,13 +94,14 @@ func TestHandleTranscript_VADEndFinalizes(t *testing.T) {
 		t.Errorf("pendingText = %q, want empty after vad_end", tr.pendingText)
 	}
 
-	// Should have 3 broadcasts: 2 tokens (partial) + 1 final
-	if len(broadcasts) != 3 {
-		t.Fatalf("expected 3 broadcasts, got %d", len(broadcasts))
+	// Should have 2 broadcasts: 1 non-final (first token) + 1 final (vad_end)
+	// Second token is throttled, but vad_end always broadcasts immediately
+	if len(broadcasts) != 2 {
+		t.Fatalf("expected 2 broadcasts (1 throttled token + 1 final), got %d", len(broadcasts))
 	}
 
 	// Last broadcast should be final with full accumulated text
-	last := broadcasts[2]
+	last := broadcasts[len(broadcasts)-1]
 	if last.text != "Hello world" {
 		t.Errorf("final broadcast text = %q, want %q", last.text, "Hello world")
 	}
@@ -174,5 +189,74 @@ func TestHandleTranscript_MultipleUtterances(t *testing.T) {
 	}
 	if finals[1] != "Second" {
 		t.Errorf("second utterance = %q, want %q", finals[1], "Second")
+	}
+}
+
+func TestHandleTranscript_ThrottlingBehavior(t *testing.T) {
+	var broadcasts []struct {
+		text  string
+		final bool
+	}
+
+	tr := testTranscriber(func(text string, final bool) {
+		broadcasts = append(broadcasts, struct {
+			text  string
+			final bool
+		}{text, final})
+	})
+
+	logger := slog.Default()
+
+	// First token: broadcasts immediately (lastBroadcast is zero)
+	tr.handleTranscript(nil, "room1", modal.Transcript{Type: "token", Text: "A"}, logger)
+	if len(broadcasts) != 1 {
+		t.Fatalf("first token should broadcast immediately, got %d broadcasts", len(broadcasts))
+	}
+
+	// Rapid tokens: throttled (within 2s window)
+	tr.handleTranscript(nil, "room1", modal.Transcript{Type: "token", Text: " B"}, logger)
+	tr.handleTranscript(nil, "room1", modal.Transcript{Type: "token", Text: " C"}, logger)
+	if len(broadcasts) != 1 {
+		t.Fatalf("rapid tokens should be throttled, got %d broadcasts", len(broadcasts))
+	}
+
+	// Simulate throttle window passing
+	tr.lastBroadcast = time.Now().Add(-3 * time.Second)
+	tr.handleTranscript(nil, "room1", modal.Transcript{Type: "token", Text: " D"}, logger)
+
+	if len(broadcasts) != 2 {
+		t.Fatalf("token after throttle window should broadcast, got %d broadcasts", len(broadcasts))
+	}
+	if broadcasts[1].text != "A B C D" {
+		t.Errorf("throttled broadcast text = %q, want %q", broadcasts[1].text, "A B C D")
+	}
+}
+
+func TestFlushPendingBroadcast(t *testing.T) {
+	var broadcasts []string
+
+	tr := testTranscriber(func(text string, final bool) {
+		broadcasts = append(broadcasts, text)
+	})
+
+	logger := slog.Default()
+
+	// Nothing to flush
+	tr.flushPendingBroadcast(logger)
+	if len(broadcasts) != 0 {
+		t.Error("flush with no pending text should not broadcast")
+	}
+
+	// Set up pending text
+	tr.pendingText = "accumulated text"
+	tr.broadcastDirty = true
+	tr.lastBroadcast = time.Time{} // allow flush
+
+	tr.flushPendingBroadcast(logger)
+	if len(broadcasts) != 1 || broadcasts[0] != "accumulated text" {
+		t.Errorf("expected flush to broadcast 'accumulated text', got %v", broadcasts)
+	}
+	if tr.broadcastDirty {
+		t.Error("broadcastDirty should be false after flush")
 	}
 }

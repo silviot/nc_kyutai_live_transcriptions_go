@@ -31,8 +31,10 @@ type Transcriber struct {
 	audioPipe    *audio.Pipeline
 	audioInputCh chan []float32 // Decoded float32 PCM from WebRTC (48kHz)
 	audioOutCh   chan []float32 // Processed audio chunks for Modal (24kHz)
-	broadcast    func(text string, final bool) // Callback to broadcast transcript to room participants
-	pendingText  string                       // Accumulated tokens for current utterance
+	broadcast      func(text string, final bool) // Callback to broadcast transcript to room participants
+	pendingText    string                       // Accumulated tokens for current utterance
+	lastBroadcast  time.Time                    // Last time a non-final broadcast was sent
+	broadcastDirty bool                         // Whether there's unsent accumulated text
 	mu           sync.Mutex
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -48,9 +50,10 @@ type Room struct {
 	Speakers     map[string]*Speaker  // HPB sessionID -> Speaker
 	ModalClients map[string]*modal.Client // HPB sessionID -> Modal client
 	modalConfig  modal.Config // Modal client configuration
-	// Session ID mapping: OCS session ID ↔ HPB session ID
-	ocsToHPB     map[string]string // OCS roomsessionid -> HPB sessionid
-	hpbToOCS     map[string]string // HPB sessionid -> OCS roomsessionid
+	// internalSessions tracks HPB session IDs that belong to this bot
+	// (identified via "internal":true in participants updates).
+	// Used to avoid adding our own sessions as speakers after HPB reconnects.
+	internalSessions map[string]bool
 	mu           sync.RWMutex
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -160,18 +163,17 @@ func (m *Manager) JoinRoom(ctx context.Context, roomToken, languageID string, tu
 	roomCtx, cancel := context.WithCancel(context.Background())
 
 	room := &Room{
-		RoomToken:    roomToken,
-		LanguageID:   languageID,
-		HPBClient:    hpbClient,
-		WebRTCMgr:    webrtcMgr,
-		Speakers:     make(map[string]*Speaker),
-		ModalClients: make(map[string]*modal.Client),
-		modalConfig:  m.modalConfig,
-		ocsToHPB:     make(map[string]string),
-		hpbToOCS:     make(map[string]string),
-		ctx:          roomCtx,
-		cancel:       cancel,
-		logger:       m.logger,
+		RoomToken:        roomToken,
+		LanguageID:       languageID,
+		HPBClient:        hpbClient,
+		WebRTCMgr:        webrtcMgr,
+		Speakers:         make(map[string]*Speaker),
+		ModalClients:     make(map[string]*modal.Client),
+		modalConfig:      m.modalConfig,
+		internalSessions: make(map[string]bool),
+		ctx:              roomCtx,
+		cancel:           cancel,
+		logger:           m.logger,
 	}
 
 	m.rooms[roomToken] = room
@@ -281,33 +283,21 @@ func (r *Room) handleEventMessage(msg *hpb.EventMessage) {
 	}
 }
 
-// handleRoomEvent handles room-level join/leave events
+// handleRoomEvent handles room-level join/leave events.
+// Only maintains session ID mappings here; speaker addition is handled by
+// handleParticipantsEvent which has the "internal" flag to correctly
+// identify and skip our own bot sessions (important after HPB reconnects
+// where the bot gets a new session ID but old sessions remain visible).
 func (r *Room) handleRoomEvent(msg *hpb.EventMessage) {
-	// Process join events - add speakers directly
 	for _, entry := range msg.Event.Join {
 		r.logger.Info("session joined room", "sessionID", entry.SessionID, "userID", entry.UserID)
 
-		// Build session ID mapping
-		if entry.RoomSessionID != "" {
+		// Track our own current session as internal
+		if entry.SessionID == r.HPBClient.SessionID() {
 			r.mu.Lock()
-			r.ocsToHPB[entry.RoomSessionID] = entry.SessionID
-			r.hpbToOCS[entry.SessionID] = entry.RoomSessionID
+			r.internalSessions[entry.SessionID] = true
 			r.mu.Unlock()
 		}
-
-		// Skip our own session
-		if entry.SessionID == r.HPBClient.SessionID() {
-			continue
-		}
-
-		// Add as speaker immediately (don't wait for participants update)
-		displayName := entry.UserID
-		if entry.User != nil {
-			if dn, ok := entry.User["displayname"].(string); ok && dn != "" {
-				displayName = dn
-			}
-		}
-		r.addSpeaker(entry.SessionID, entry.UserID, displayName)
 	}
 	// Handle leaves
 	for _, sessionID := range msg.Event.Leave {
@@ -315,6 +305,11 @@ func (r *Room) handleRoomEvent(msg *hpb.EventMessage) {
 		r.removeSpeaker(sessionID)
 	}
 }
+
+// stalePingThreshold is the maximum age of a participant's lastPing before
+// they are considered stale and ignored. This prevents creating Modal
+// connections for ghost participants that the HPB still reports as in-call.
+const stalePingThreshold = 120 * time.Second
 
 // handleParticipantsEvent handles participants update from Nextcloud backend.
 // This is the main way we learn about who is in the call with audio.
@@ -340,25 +335,52 @@ func (r *Room) handleParticipantsEvent(msg *hpb.EventMessage) {
 
 	r.logger.Info("participants update", "userCount", len(users))
 
+	now := time.Now()
+
 	for _, user := range users {
-		ocsSessionID, _ := user["sessionId"].(string)
-		if ocsSessionID == "" {
+		// The "sessionId" in participants events is the HPB session ID
+		// (same format as entry.SessionID in room join events), NOT the
+		// OCS room session ID (which is a separate 255-char string).
+		sessionID, _ := user["sessionId"].(string)
+		if sessionID == "" {
 			continue
 		}
 
-		// Skip internal sessions (that's us)
-		if internal, ok := user["internal"].(bool); ok && internal {
+		userID, _ := user["userId"].(string)
+		internal, _ := user["internal"].(bool)
+
+		// Track and skip internal sessions (our own bot sessions).
+		// This is critical after HPB reconnects: the bot gets a new session ID
+		// but old bot sessions may still be visible in the room.
+		if internal {
+			r.mu.Lock()
+			r.internalSessions[sessionID] = true
+			r.mu.Unlock()
+			r.removeSpeaker(sessionID)
 			continue
 		}
 
-		// Translate OCS session ID to HPB session ID
+		// Check if this is a known internal session (defense in depth)
 		r.mu.RLock()
-		hpbSessionID, mapped := r.ocsToHPB[ocsSessionID]
+		isInternal := r.internalSessions[sessionID]
 		r.mu.RUnlock()
-
-		if !mapped {
-			r.logger.Debug("no HPB session mapping for OCS session", "ocsSessionID_len", len(ocsSessionID))
+		if isInternal {
 			continue
+		}
+
+		// Check lastPing staleness: skip participants whose ping is too old.
+		// Ghost participants (e.g. browser crashed without clean disconnect)
+		// stay in the HPB participant list but stop sending pings.
+		if lastPing, ok := user["lastPing"].(float64); ok && lastPing > 0 {
+			pingTime := time.Unix(int64(lastPing), 0)
+			pingAge := now.Sub(pingTime)
+			if pingAge > stalePingThreshold {
+				r.logger.Warn("skipping stale participant",
+					"sessionID", sessionID, "lastPing", int64(lastPing),
+					"pingAge", pingAge.Round(time.Second))
+				r.removeSpeaker(sessionID)
+				continue
+			}
 		}
 
 		// Parse inCall flags
@@ -373,21 +395,19 @@ func (r *Room) handleParticipantsEvent(msg *hpb.EventMessage) {
 		inCall := inCallFlags&hpb.CallFlagInCall != 0
 		withAudio := inCallFlags&2 != 0 // WITH_AUDIO = 2
 
-		userID, _ := user["userId"].(string)
 		displayName, _ := user["displayname"].(string)
 		if displayName == "" {
 			displayName = userID
 		}
 
 		r.logger.Debug("participant status",
-			"hpbSessionID", hpbSessionID, "userID", userID, "inCall", inCallFlags,
+			"sessionID", sessionID, "userID", userID, "inCall", inCallFlags,
 			"isInCall", inCall, "withAudio", withAudio)
 
 		if inCallFlags == 0 {
-			// User disconnected
-			r.removeSpeaker(hpbSessionID)
+			r.removeSpeaker(sessionID)
 		} else if inCall && withAudio {
-			r.addSpeaker(hpbSessionID, userID, displayName)
+			r.addSpeaker(sessionID, userID, displayName)
 		}
 	}
 }
