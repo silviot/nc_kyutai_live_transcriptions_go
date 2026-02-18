@@ -299,6 +299,6 @@ Orchestrator
 
 5. **API contract completeness:** Any undocumented Python behaviors needed?
    - **Status:** Basic endpoints implemented (POST /transcribe, GET /healthz)
-   - Test with actual Nextcloud Talk instance: https://cloud.codemyriad.io
+   - Test with actual Nextcloud Talk instance (see LIVE_TESTING.md)
    - Compare behavior with Python roundtrip_modal.py script
 

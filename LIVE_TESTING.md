@@ -4,10 +4,18 @@ This guide explains how to test the Go transcription service against a real Next
 
 ## Test Environment
 
-- **Nextcloud Instance**: https://cloud.codemyriad.io
-- **Test Room**: https://cloud.codemyriad.io/call/erwcr27x
-- **HPB URL**: wss://cloud.codemyriad.io/standalone-signaling/spreed
-- **Installation**: Nextcloud AIO (All-in-One)
+Set these variables for your Nextcloud instance before proceeding:
+
+```bash
+export NEXTCLOUD_URL="https://your.nextcloud.instance"
+export NEXTCLOUD_HOST="your.nextcloud.instance"  # just the hostname
+export TALK_ROOM_TOKEN="your-room-token"
+```
+
+- **Nextcloud Instance**: `$NEXTCLOUD_URL`
+- **Test Room**: `$NEXTCLOUD_URL/call/$TALK_ROOM_TOKEN`
+- **HPB URL**: `wss://$NEXTCLOUD_HOST/standalone-signaling/spreed`
+- **Installation**: Nextcloud AIO (All-in-One) recommended
 
 ## Prerequisites
 
@@ -22,9 +30,9 @@ source ../nc_kyutai_live_transcriptions/.envrc
 Or set them manually:
 
 ```bash
-export LT_HPB_URL="wss://cloud.codemyriad.io/standalone-signaling/spreed"
+export LT_HPB_URL="wss://$NEXTCLOUD_HOST/standalone-signaling/spreed"
 export LT_INTERNAL_SECRET="<your-secret>"
-export MODAL_WORKSPACE="silviot"
+export MODAL_WORKSPACE="<your-workspace>"
 export MODAL_KEY="<your-key>"
 export MODAL_SECRET="<your-secret>"
 ```
@@ -63,7 +71,7 @@ The E2E test tool (`tools/e2e/main.go`) performs a comprehensive end-to-end test
 
 # Full options
 go run ./tools/e2e/main.go \
-    --room-url "https://cloud.codemyriad.io/call/erwcr27x" \
+    --room-url "$NEXTCLOUD_URL/call/$TALK_ROOM_TOKEN" \
     --duration 30 \
     --audio-file /path/to/speech.wav \
     --language en \
@@ -97,7 +105,7 @@ go run ./tools/e2e/main.go \
    ```
 
 2. **Open the test room in a browser**:
-   https://cloud.codemyriad.io/call/erwcr27x
+   `$NEXTCLOUD_URL/call/$TALK_ROOM_TOKEN`
 
 3. **Join as a guest or logged-in user**
 
@@ -125,7 +133,7 @@ To verify identical behavior:
    source .envrc
    source ../kyutai_modal/.envrc
    uv run python tools/roundtrip_modal.py \
-     --room-url https://cloud.codemyriad.io/call/erwcr27x \
+     --room-url "$NEXTCLOUD_URL/call/$TALK_ROOM_TOKEN" \
      --duration 30 \
      --enable-transcription
    ```
@@ -150,7 +158,7 @@ To verify identical behavior:
 The Nextcloud instance is accessible via SSH:
 
 ```bash
-ssh cloud.codemyriad.io
+ssh $NEXTCLOUD_HOST
 ```
 
 ### Installing/Reinstalling the App
@@ -158,7 +166,7 @@ ssh cloud.codemyriad.io
 Use `docker exec` to run `php occ` commands for managing the transcription app:
 
 ```bash
-ssh cloud.codemyriad.io
+ssh $NEXTCLOUD_HOST
 
 # Uninstall the app
 sudo docker exec -it nextcloud-aio-nextcloud php occ app:disable nc_kyutai_live_transcriptions
@@ -203,7 +211,7 @@ Usually means:
 
 Check HPB logs:
 ```bash
-ssh cloud.codemyriad.io
+ssh $NEXTCLOUD_HOST
 sudo docker logs nextcloud-aio-talk 2>&1 | tail -50
 ```
 

@@ -21,7 +21,7 @@ check_env() {
         echo "  source ../nc_kyutai_live_transcriptions/.envrc"
         echo ""
         echo "Or set them manually:"
-        echo "  export LT_HPB_URL=wss://cloud.codemyriad.io/standalone-signaling/spreed"
+        echo "  export LT_HPB_URL=wss://\$NEXTCLOUD_HOST/standalone-signaling/spreed"
         echo "  export LT_INTERNAL_SECRET=<your-secret>"
         echo "  export MODAL_WORKSPACE=<your-workspace>"
         echo "  export MODAL_KEY=<your-key>"
@@ -40,9 +40,9 @@ check_env "MODAL_SECRET"
 echo ""
 
 # Configuration
-ROOM_TOKEN="${TALK_ROOM_TOKEN:-erwcr27x}"
+ROOM_TOKEN="${TALK_ROOM_TOKEN:?Set TALK_ROOM_TOKEN to your test room token}"
 SERVICE_PORT="${PORT:-8080}"
-NEXTCLOUD_URL="${NEXTCLOUD_URL:-https://cloud.codemyriad.io}"
+NEXTCLOUD_URL="${NEXTCLOUD_URL:?Set NEXTCLOUD_URL to your Nextcloud instance URL}"
 
 echo "Configuration:"
 echo "  Room Token: $ROOM_TOKEN"

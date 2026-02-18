@@ -124,8 +124,8 @@ Nextcloud Talk (FastAPI Python)
 4. Memory profiling with `pprof`
 
 **Live Testing:**
-- Nextcloud instance: https://cloud.codemyriad.io (AIO install)
-- Test room: https://cloud.codemyriad.io/call/erwcr27x
+- Nextcloud instance: `$NEXTCLOUD_URL` (Nextcloud AIO recommended)
+- Test room: `$NEXTCLOUD_URL/call/$TALK_ROOM_TOKEN`
 - See `LIVE_TESTING.md` for detailed instructions
 - Use `make live-test` for automated basic tests
 

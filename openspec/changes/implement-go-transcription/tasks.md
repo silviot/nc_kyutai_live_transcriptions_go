@@ -129,9 +129,9 @@
 
 ### 4.5 Live Testing (NEW - Nextcloud Integration)
 - [ ] 4.5.1 Create scripts/test-live.sh for testing against live Nextcloud
-- [ ] 4.5.2 Document Nextcloud AIO setup (cloud.codemyriad.io)
+- [ ] 4.5.2 Document Nextcloud AIO setup (see LIVE_TESTING.md)
 - [ ] 4.5.3 Test HPB connection with real signaling server
-- [ ] 4.5.4 Test WebRTC audio reception in test room (erwcr27x)
+- [ ] 4.5.4 Test WebRTC audio reception in test room
 - [ ] 4.5.5 Test transcript delivery to Talk participants
 - [ ] 4.5.6 Compare behavior with Python implementation
 
