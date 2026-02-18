@@ -309,7 +309,10 @@ func (r *Room) handleRoomEvent(msg *hpb.EventMessage) {
 // stalePingThreshold is the maximum age of a participant's lastPing before
 // they are considered stale and ignored. This prevents creating Modal
 // connections for ghost participants that the HPB still reports as in-call.
-const stalePingThreshold = 120 * time.Second
+// Set generously: Nextcloud browsers ping every ~30s but this can drift,
+// and after HPB reconnects the participant list may contain slightly stale
+// pings. 10 minutes is safe — truly stale ghosts will have pings hours old.
+const stalePingThreshold = 10 * time.Minute
 
 // handleParticipantsEvent handles participants update from Nextcloud backend.
 // This is the main way we learn about who is in the call with audio.

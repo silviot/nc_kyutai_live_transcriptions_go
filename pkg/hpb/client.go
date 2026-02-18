@@ -271,8 +271,8 @@ func (c *Client) readLoop() {
 			continue
 		}
 
-		// Use longer read deadline since pings keep connection alive
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		// Use generous read deadline — HPB sends periodic events and pings
+		c.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
 			if !strings.Contains(err.Error(), "context canceled") && !strings.Contains(err.Error(), "use of closed") {
@@ -397,6 +397,13 @@ func (c *Client) handleMessage(data []byte) error {
 			c.logger.Error("HPB error", "code", msg.Error.Code, "message", msg.Error.Message, "details", msg.Error.Details)
 		} else {
 			c.logger.Error("HPB error", "code", msg.Code, "message", msg.Message)
+		}
+
+	case "ping":
+		// Server-initiated keep-alive — respond with pong
+		pong := PongMessage{Type: "pong"}
+		if err := c.SendMessage(pong); err != nil {
+			c.logger.Error("failed to send pong", "error", err)
 		}
 
 	case "pong":
