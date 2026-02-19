@@ -89,6 +89,15 @@ docker-compose logs -f transcribe-service
 docker-compose down
 ```
 
+### Post-deploy ExApp Network Smoke Test
+
+Run this on the Docker host to catch DNS wiring regressions (for example
+missing `live_transcription` network alias):
+
+```bash
+./scripts/check-exapp-network.sh
+```
+
 ## Kubernetes Deployment
 
 ### Deployment Manifest
