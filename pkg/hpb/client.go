@@ -20,41 +20,46 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	hpbReadTimeout         = 3 * time.Minute
+	hpbControlWriteTimeout = 5 * time.Second
+)
+
 // Client manages WebSocket connection to HPB with reconnection and internal auth
 type Client struct {
-	hpbURL           string
-	backendURL       string
-	secret           string // Internal client secret (for WebSocket HMAC auth)
-	signalingSecret  string // Backend signaling secret (for HTTP API auth)
-	ticketURL        string
-	ticket           string
-	token            string // JWT token for v2.0 auth
-	resumeID         string
-	sessionID        string
-	conn             *websocket.Conn
-	mu               sync.Mutex
-	logger           *slog.Logger
-	msgChan          chan interface{}
-	errChan          chan error
-	closeChan        chan struct{}
-	ctx              context.Context
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup
-	msgID            atomic.Int64
+	hpbURL          string
+	backendURL      string
+	secret          string // Internal client secret (for WebSocket HMAC auth)
+	signalingSecret string // Backend signaling secret (for HTTP API auth)
+	ticketURL       string
+	ticket          string
+	token           string // JWT token for v2.0 auth
+	resumeID        string
+	sessionID       string
+	conn            *websocket.Conn
+	mu              sync.Mutex
+	logger          *slog.Logger
+	msgChan         chan interface{}
+	errChan         chan error
+	closeChan       chan struct{}
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	msgID           atomic.Int64
 }
 
 // Config holds HPB client configuration
 type Config struct {
-	HPBURL          string       // HPB WebSocket URL
-	BackendURL      string       // Nextcloud backend URL (for auth)
-	Secret          string       // HMAC secret for internal WebSocket authentication
-	SignalingSecret string       // Backend signaling secret (for HTTP API auth, different from internal secret)
+	HPBURL          string // HPB WebSocket URL
+	BackendURL      string // Nextcloud backend URL (for auth)
+	Secret          string // HMAC secret for internal WebSocket authentication
+	SignalingSecret string // Backend signaling secret (for HTTP API auth, different from internal secret)
 	// Ticket-based auth v1.0 (for regular users, mutually exclusive with Secret)
 	TicketURL string // Auth URL from signaling settings helloAuthParams
 	Ticket    string // Ticket from signaling settings helloAuthParams
 	// JWT token auth v2.0 (newer signaling)
-	Token     string       // JWT token from signaling settings helloAuthParams["2.0"].token
-	Logger    *slog.Logger // Logger instance
+	Token  string       // JWT token from signaling settings helloAuthParams["2.0"].token
+	Logger *slog.Logger // Logger instance
 }
 
 // NewClient creates a new HPB client
@@ -89,12 +94,12 @@ func NewClient(cfg Config) *Client {
 		ticketURL:       cfg.TicketURL,
 		ticket:          cfg.Ticket,
 		token:           cfg.Token,
-		logger:     cfg.Logger,
-		msgChan:    make(chan interface{}, 100), // Bounded message queue
-		errChan:    make(chan error, 10),
-		closeChan:  make(chan struct{}),
-		ctx:        ctx,
-		cancel:     cancel,
+		logger:          cfg.Logger,
+		msgChan:         make(chan interface{}, 100), // Bounded message queue
+		errChan:         make(chan error, 10),
+		closeChan:       make(chan struct{}),
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 }
 
@@ -126,6 +131,18 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.logger.Error("failed to connect to HPB", "url", c.hpbURL, "error", err)
 		return err
 	}
+
+	// Keep read deadlines alive from control frames too. Without this, quiet
+	// rooms can hit read deadline even while ping/pong is healthy, causing
+	// avoidable reconnect churn.
+	conn.SetPongHandler(func(appData string) error {
+		return conn.SetReadDeadline(time.Now().Add(hpbReadTimeout))
+	})
+	conn.SetPingHandler(func(appData string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(hpbReadTimeout))
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(hpbControlWriteTimeout))
+	})
+	_ = conn.SetReadDeadline(time.Now().Add(hpbReadTimeout))
 
 	c.conn = conn
 	c.logger.Info("connected to HPB", "url", c.hpbURL)
@@ -271,8 +288,8 @@ func (c *Client) readLoop() {
 			continue
 		}
 
-		// Use generous read deadline — HPB sends periodic events and pings
-		c.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		// Keep a generous read deadline; pong/ping handlers refresh it.
+		c.conn.SetReadDeadline(time.Now().Add(hpbReadTimeout))
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
 			if !strings.Contains(err.Error(), "context canceled") && !strings.Contains(err.Error(), "use of closed") {
@@ -324,7 +341,7 @@ func (c *Client) sendPing() error {
 		return fmt.Errorf("connection closed")
 	}
 
-	return c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
+	return c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(hpbControlWriteTimeout))
 }
 
 // handleMessage routes incoming messages to appropriate handlers

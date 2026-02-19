@@ -31,6 +31,7 @@ type Transcriber struct {
 	audioPipe      *audio.Pipeline
 	audioInputCh   chan []float32                // Decoded float32 PCM from WebRTC (48kHz)
 	audioOutCh     chan []float32                // Processed audio chunks for Modal (24kHz)
+	audioDoneCh    chan struct{}                 // Closed when audio processing loop has flushed
 	broadcast      func(text string, final bool) // Callback to broadcast transcript to room participants
 	pendingText    string                        // Accumulated tokens for current utterance
 	lastBroadcast  time.Time                     // Last time a non-final broadcast was sent
@@ -402,6 +403,9 @@ func (r *Room) handleParticipantsEvent(msg *hpb.EventMessage) {
 
 		displayName, _ := user["displayname"].(string)
 		if displayName == "" {
+			displayName, _ = user["displayName"].(string)
+		}
+		if displayName == "" {
 			displayName = userID
 		}
 
@@ -596,6 +600,7 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 		// delivering delayed transcripts seconds later.
 		audioInputCh: make(chan []float32, 120), // ~2.4s at ~20ms input frames
 		audioOutCh:   make(chan []float32, 25),  // ~2.0s of 80ms chunks
+		audioDoneCh:  make(chan struct{}),
 		broadcast: func(text string, final bool) {
 			// Broadcast transcript to all room participants via HPB backend API.
 			// This sends an HTTP POST to the signaling server which broadcasts

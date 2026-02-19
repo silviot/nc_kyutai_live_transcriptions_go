@@ -262,21 +262,7 @@ func TestFlushPendingBroadcast(t *testing.T) {
 	}
 }
 
-func TestCurrentPartialText_TruncatesLongPending(t *testing.T) {
-	tr := testTranscriber(nil)
-
-	long := strings.Repeat("x", maxPartialBroadcastChars+50)
-	tr.pendingText = long
-
-	got := tr.currentPartialText()
-	want := "..." + long[len(long)-maxPartialBroadcastChars:]
-
-	if got != want {
-		t.Errorf("currentPartialText() length=%d, want length=%d", len(got), len(want))
-	}
-}
-
-func TestFlushPendingBroadcast_UsesBoundedPartial(t *testing.T) {
+func TestFlushPendingBroadcast_DoesNotTruncateLongPartial(t *testing.T) {
 	var broadcasts []string
 
 	tr := testTranscriber(func(text string, final bool) {
@@ -284,7 +270,8 @@ func TestFlushPendingBroadcast_UsesBoundedPartial(t *testing.T) {
 	})
 	logger := slog.Default()
 
-	tr.pendingText = strings.Repeat("y", maxPartialBroadcastChars+20)
+	long := strings.Repeat("y", 1200)
+	tr.pendingText = long
 	tr.broadcastDirty = true
 
 	tr.flushPendingBroadcast(logger)
@@ -292,11 +279,8 @@ func TestFlushPendingBroadcast_UsesBoundedPartial(t *testing.T) {
 	if len(broadcasts) != 1 {
 		t.Fatalf("expected 1 broadcast, got %d", len(broadcasts))
 	}
-	if len(broadcasts[0]) > maxPartialBroadcastChars+3 {
-		t.Fatalf("broadcast too long: len=%d", len(broadcasts[0]))
-	}
-	if broadcasts[0] != tr.currentPartialText() {
-		t.Fatalf("flush broadcast mismatch with currentPartialText")
+	if broadcasts[0] != long {
+		t.Fatalf("flush should send full partial text, got len=%d want len=%d", len(broadcasts[0]), len(long))
 	}
 }
 

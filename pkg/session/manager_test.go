@@ -397,6 +397,42 @@ func TestHandleParticipantsEvent_KnownInternalSessionSkipped(t *testing.T) {
 	}
 }
 
+func TestHandleParticipantsEvent_DisplayNameCamelCaseAccepted(t *testing.T) {
+	room := newTestRoom("")
+
+	msg := &hpb.EventMessage{
+		Type: "event",
+		Event: hpb.EventInner{
+			Target: "participants",
+			Type:   "update",
+			Update: &hpb.RoomEventUpdate{
+				Users: []map[string]interface{}{
+					{
+						"sessionId":   "guest-session",
+						"inCall":      float64(3), // IN_CALL | WITH_AUDIO
+						"lastPing":    float64(time.Now().Unix()),
+						"displayName": "Guest Speaker",
+					},
+				},
+			},
+		},
+	}
+
+	room.handleParticipantsEvent(msg)
+	defer room.cancel()
+
+	room.mu.RLock()
+	speaker, exists := room.Speakers["guest-session"]
+	room.mu.RUnlock()
+	if !exists {
+		t.Fatalf("expected speaker to be added")
+	}
+	if speaker.Name != "Guest Speaker" {
+		t.Fatalf("speaker.Name=%q want %q", speaker.Name, "Guest Speaker")
+	}
+	_ = room.removeSpeaker("guest-session")
+}
+
 // TestReconnectCycleSimulation simulates the exact ghost speaker bug scenario:
 // HPB reconnect → join events for old bot sessions → participants update
 // reveals they're internal → they should be filtered out, not added as speakers.
