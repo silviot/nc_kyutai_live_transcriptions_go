@@ -6,9 +6,10 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # Required - set these to your actual values
+      # Required - set HPB vars and either STT_STREAM_URL or Modal vars
       LT_HPB_URL: ${LT_HPB_URL:-wss://hpb.example.com}
       LT_INTERNAL_SECRET: ${LT_INTERNAL_SECRET:-your-secret}
+      STT_STREAM_URL: ${STT_STREAM_URL:-}
       MODAL_WORKSPACE: ${MODAL_WORKSPACE:-your-workspace}
       MODAL_KEY: ${MODAL_KEY:-your-key}
       MODAL_SECRET: ${MODAL_SECRET:-your-secret}

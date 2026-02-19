@@ -3,10 +3,10 @@
 ## Pre-Deployment Checklist
 
 - [ ] Go 1.22+ installed (or Docker available)
-- [ ] Modal workspace credentials configured
+- [ ] STT backend configured (custom `STT_STREAM_URL` or Modal credentials)
 - [ ] Nextcloud Talk with HPB enabled
 - [ ] TURN servers configured in Talk
-- [ ] Network access to HPB and Modal endpoints
+- [ ] Network access to HPB and STT endpoint
 
 ## Local Development
 
@@ -27,9 +27,7 @@
 ```bash
 export LT_HPB_URL="wss://your-hpb-server"
 export LT_INTERNAL_SECRET="your-secret"
-export MODAL_WORKSPACE="your-workspace"
-export MODAL_KEY="your-key"
-export MODAL_SECRET="your-secret"
+export STT_STREAM_URL="ws://100.66.230.65:8000/v1/stream"
 
 ./transcribe-service -port 8080
 ```
@@ -54,6 +52,17 @@ docker run \
   -p 8080:8080 \
   -e LT_HPB_URL="wss://your-hpb-server" \
   -e LT_INTERNAL_SECRET="your-secret" \
+  -e STT_STREAM_URL="ws://100.66.230.65:8000/v1/stream" \
+  kyutai-transcribe:latest
+```
+
+Or with Modal credentials:
+
+```bash
+docker run \
+  -p 8080:8080 \
+  -e LT_HPB_URL="wss://your-hpb-server" \
+  -e LT_INTERNAL_SECRET="your-secret" \
   -e MODAL_WORKSPACE="your-workspace" \
   -e MODAL_KEY="your-key" \
   -e MODAL_SECRET="your-secret" \
@@ -67,9 +76,7 @@ docker run \
 cat > .env << EOF
 LT_HPB_URL=wss://your-hpb-server
 LT_INTERNAL_SECRET=your-secret
-MODAL_WORKSPACE=your-workspace
-MODAL_KEY=your-key
-MODAL_SECRET=your-secret
+STT_STREAM_URL=ws://100.66.230.65:8000/v1/stream
 EOF
 
 # Start service
@@ -187,9 +194,12 @@ kubectl apply -f deployment.yaml
 Required:
 - `LT_HPB_URL` - HPB WebSocket URL (e.g., `wss://hpb.example.com`)
 - `LT_INTERNAL_SECRET` - HPB HMAC secret
-- `MODAL_WORKSPACE` - Modal workspace name
-- `MODAL_KEY` - Modal API key
-- `MODAL_SECRET` - Modal API secret
+- Either:
+  - `STT_STREAM_URL` - STT WebSocket URL override
+- Or:
+  - `MODAL_WORKSPACE` - Modal workspace name
+  - `MODAL_KEY` - Modal API key
+  - `MODAL_SECRET` - Modal API secret
 
 Optional:
 - `PORT` - HTTP port (default: 8080)

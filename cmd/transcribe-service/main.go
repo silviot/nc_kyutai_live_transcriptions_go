@@ -19,13 +19,14 @@ import (
 func main() {
 	// Parse flags
 	var (
-		port            = flag.String("port", "8080", "HTTP server port")
-		hpbURL          = flag.String("hpb-url", "", "HPB signaling server URL")
-		hpbSecret       = flag.String("hpb-secret", "", "HPB HMAC secret")
-		modalWorkspace  = flag.String("modal-workspace", "", "Modal workspace name")
-		modalKey        = flag.String("modal-key", "", "Modal API key")
-		modalSecret     = flag.String("modal-secret", "", "Modal API secret")
-		logLevel        = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+		port           = flag.String("port", "8080", "HTTP server port")
+		hpbURL         = flag.String("hpb-url", "", "HPB signaling server URL")
+		hpbSecret      = flag.String("hpb-secret", "", "HPB HMAC secret")
+		sttStreamURL   = flag.String("stt-stream-url", "", "Optional STT WebSocket URL override")
+		modalWorkspace = flag.String("modal-workspace", "", "Modal workspace name")
+		modalKey       = flag.String("modal-key", "", "Modal API key")
+		modalSecret    = flag.String("modal-secret", "", "Modal API secret")
+		logLevel       = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	)
 	flag.Parse()
 
@@ -43,6 +44,9 @@ func main() {
 	if *hpbSecret == "" {
 		*hpbSecret = os.Getenv("LT_INTERNAL_SECRET")
 	}
+	if *sttStreamURL == "" {
+		*sttStreamURL = os.Getenv("STT_STREAM_URL")
+	}
 	if *modalWorkspace == "" {
 		*modalWorkspace = os.Getenv("MODAL_WORKSPACE")
 	}
@@ -54,10 +58,15 @@ func main() {
 	}
 
 	// Validate required configuration
-	if *hpbURL == "" || *hpbSecret == "" || *modalWorkspace == "" || *modalKey == "" || *modalSecret == "" {
+	useCustomSTT := *sttStreamURL != ""
+	modalCredsPresent := *modalWorkspace != "" && *modalKey != "" && *modalSecret != ""
+	if *hpbURL == "" || *hpbSecret == "" || (!useCustomSTT && !modalCredsPresent) {
 		fmt.Fprintf(os.Stderr, "Error: Missing required environment variables:\n")
 		fmt.Fprintf(os.Stderr, "  LT_HPB_URL\n")
 		fmt.Fprintf(os.Stderr, "  LT_INTERNAL_SECRET\n")
+		fmt.Fprintf(os.Stderr, "And either:\n")
+		fmt.Fprintf(os.Stderr, "  STT_STREAM_URL\n")
+		fmt.Fprintf(os.Stderr, "Or all Modal vars:\n")
 		fmt.Fprintf(os.Stderr, "  MODAL_WORKSPACE\n")
 		fmt.Fprintf(os.Stderr, "  MODAL_KEY\n")
 		fmt.Fprintf(os.Stderr, "  MODAL_SECRET\n")
@@ -74,10 +83,13 @@ func main() {
 	// Setup logging
 	logger := setupLogger(*logLevel)
 
-	logger.Info("starting transcription service",
-		"port", *port,
-		"hpb_url", *hpbURL,
-		"modal_workspace", *modalWorkspace)
+	logArgs := []interface{}{"port", *port, "hpb_url", *hpbURL}
+	if useCustomSTT {
+		logArgs = append(logArgs, "stt_stream_url", *sttStreamURL)
+	} else {
+		logArgs = append(logArgs, "modal_workspace", *modalWorkspace)
+	}
+	logger.Info("starting transcription service", logArgs...)
 
 	// Derive HPB backend URL from NEXTCLOUD_URL env var
 	// Must match exactly what's configured in signaling.conf [backend] url
@@ -93,6 +105,7 @@ func main() {
 		HPBSecret:          *hpbSecret,
 		HPBSignalingSecret: hpbSignalingSecret,
 		HPBBackendURL:      hpbBackendURL,
+		STTStreamURL:       *sttStreamURL,
 		ModalWorkspace:     *modalWorkspace,
 		ModalKey:           *modalKey,
 		ModalSecret:        *modalSecret,
@@ -111,7 +124,7 @@ func main() {
 	}
 
 	hpbConfigured := *hpbURL != "" && *hpbSecret != ""
-	modalConfigured := *modalWorkspace != "" && *modalKey != "" && *modalSecret != ""
+	modalConfigured := useCustomSTT || modalCredsPresent
 
 	// Supported languages in Talk's expected format:
 	// dict of langCode -> {name, metadata: {separator, rtl}}

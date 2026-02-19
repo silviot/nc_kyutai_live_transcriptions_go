@@ -1,6 +1,6 @@
 # Kyutai Live Transcription Service (Go)
 
-Real-time speech-to-text for Nextcloud Talk using Go, WebRTC, and Modal's Kyutai STT.
+Real-time speech-to-text for Nextcloud Talk using Go, WebRTC, and a streaming STT WebSocket backend.
 
 ## Features
 
@@ -8,7 +8,7 @@ Real-time speech-to-text for Nextcloud Talk using Go, WebRTC, and Modal's Kyutai
 - HPB WebSocket signaling (HMAC-SHA256 authentication)
 - WebRTC peer connections via pion/webrtc (audio reception)
 - Audio resampling (48kHz → 24kHz)
-- Streaming to Modal Kyutai STT service
+- Streaming to STT WebSocket backend (Modal or custom endpoint)
 - Transcript delivery back to Nextcloud Talk
 
 ✅ **Architecture Benefits**
@@ -34,6 +34,10 @@ go build -o transcribe-service ./cmd/transcribe-service
 # Run with environment variables
 export LT_HPB_URL="wss://your-hpb-server"
 export LT_INTERNAL_SECRET="your-secret"
+# Option A: custom STT endpoint
+export STT_STREAM_URL="ws://100.66.230.65:8000/v1/stream"
+
+# Option B: Modal workspace (fallback/default mode)
 export MODAL_WORKSPACE="your-workspace"
 export MODAL_KEY="your-key"
 export MODAL_SECRET="your-secret"
@@ -52,6 +56,17 @@ docker run \
   -p 8080:8080 \
   -e LT_HPB_URL="wss://your-hpb-server" \
   -e LT_INTERNAL_SECRET="your-secret" \
+  -e STT_STREAM_URL="ws://100.66.230.65:8000/v1/stream" \
+  kyutai-transcribe:latest
+```
+
+Or with Modal:
+
+```bash
+docker run \
+  -p 8080:8080 \
+  -e LT_HPB_URL="wss://your-hpb-server" \
+  -e LT_INTERNAL_SECRET="your-secret" \
   -e MODAL_WORKSPACE="your-workspace" \
   -e MODAL_KEY="your-key" \
   -e MODAL_SECRET="your-secret" \
@@ -64,9 +79,7 @@ docker run \
 # Set environment variables
 export LT_HPB_URL="wss://your-hpb-server"
 export LT_INTERNAL_SECRET="your-secret"
-export MODAL_WORKSPACE="your-workspace"
-export MODAL_KEY="your-key"
-export MODAL_SECRET="your-secret"
+export STT_STREAM_URL="ws://100.66.230.65:8000/v1/stream"
 
 # Run
 docker-compose up
@@ -141,6 +154,8 @@ transcription_speakers_active 5
 **Required:**
 - `LT_HPB_URL` - Nextcloud HPB WebSocket URL (e.g., `wss://hpb.example.com`)
 - `LT_INTERNAL_SECRET` - HMAC secret for HPB authentication
+- `STT_STREAM_URL` - STT WebSocket URL override (e.g., `ws://100.66.230.65:8000/v1/stream`)
+  OR
 - `MODAL_WORKSPACE` - Modal workspace name
 - `MODAL_KEY` - Modal API key
 - `MODAL_SECRET` - Modal API secret

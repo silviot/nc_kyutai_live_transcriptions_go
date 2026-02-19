@@ -24,26 +24,28 @@ type Transcript struct {
 
 // Client manages WebSocket connection to Modal STT service
 type Client struct {
-	workspace  string
-	key        string
-	secret     string
-	conn       *websocket.Conn
-	mu         sync.Mutex
-	logger     *slog.Logger
+	workspace    string
+	streamURL    string
+	key          string
+	secret       string
+	conn         *websocket.Conn
+	mu           sync.Mutex
+	logger       *slog.Logger
 	transcriptCh chan Transcript
-	errCh      chan error
-	closeCh    chan struct{}
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	connected  bool
+	errCh        chan error
+	closeCh      chan struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	connected    bool
 }
 
 // Config holds Modal client configuration
 type Config struct {
-	Workspace string       // Modal workspace name
-	Key       string       // Modal API key
-	Secret    string       // Modal API secret
+	Workspace string       // Modal workspace name (used when StreamURL is empty)
+	StreamURL string       // Optional explicit STT WebSocket URL (e.g., ws://host:8000/v1/stream)
+	Key       string       // Modal API key (optional for custom StreamURL)
+	Secret    string       // Modal API secret (optional for custom StreamURL)
 	Logger    *slog.Logger // Logger instance
 }
 
@@ -57,6 +59,7 @@ func NewClient(cfg Config) *Client {
 
 	return &Client{
 		workspace:    cfg.Workspace,
+		streamURL:    cfg.StreamURL,
 		key:          cfg.Key,
 		secret:       cfg.Secret,
 		logger:       cfg.Logger,
@@ -73,23 +76,32 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Build WebSocket URL
-	wsURL := fmt.Sprintf("wss://%s--kyutai-stt-rust-kyutaisttrustservice-serve.modal.run/v1/stream", c.workspace)
+	// Build WebSocket URL: explicit override first, Modal workspace fallback.
+	wsURL := c.streamURL
+	if wsURL == "" {
+		wsURL = fmt.Sprintf("wss://%s--kyutai-stt-rust-kyutaisttrustservice-serve.modal.run/v1/stream", c.workspace)
+	}
 
-	// Prepare headers with Modal authentication (not Basic auth)
-	headers := map[string][]string{
-		"Modal-Key":    {c.key},
-		"Modal-Secret": {c.secret},
+	// Prepare authentication headers for Modal workspace mode only.
+	// In custom StreamURL mode, do not forward Modal credentials.
+	headers := map[string][]string{}
+	if c.streamURL == "" {
+		if c.key != "" {
+			headers["Modal-Key"] = []string{c.key}
+		}
+		if c.secret != "" {
+			headers["Modal-Secret"] = []string{c.secret}
+		}
 	}
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 60 * time.Second, // Modal cold start can take time
 	}
 
-	c.logger.Info("connecting to Modal", "url", wsURL)
+	c.logger.Info("connecting to STT service", "url", wsURL)
 	conn, _, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
-		c.logger.Error("failed to connect to Modal", "workspace", c.workspace, "error", err)
+		c.logger.Error("failed to connect to STT service", "url", wsURL, "workspace", c.workspace, "error", err)
 		return err
 	}
 
@@ -112,7 +124,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.conn = conn
 	c.connected = true
-	c.logger.Info("connected to Modal STT service", "workspace", c.workspace)
+	c.logger.Info("connected to STT service", "url", wsURL, "workspace", c.workspace)
 
 	// Start read loop
 	c.wg.Add(1)

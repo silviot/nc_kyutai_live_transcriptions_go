@@ -24,21 +24,21 @@ type Speaker struct {
 
 // Transcriber manages transcription for a single speaker
 type Transcriber struct {
-	sessionID    string
-	peerConn     *webrtc.PeerConnection
-	audioCache   *audio.ChunkBuffer
-	modalClient  *modal.Client
-	audioPipe    *audio.Pipeline
-	audioInputCh chan []float32 // Decoded float32 PCM from WebRTC (48kHz)
-	audioOutCh   chan []float32 // Processed audio chunks for Modal (24kHz)
+	sessionID      string
+	peerConn       *webrtc.PeerConnection
+	audioCache     *audio.ChunkBuffer
+	modalClient    *modal.Client
+	audioPipe      *audio.Pipeline
+	audioInputCh   chan []float32                // Decoded float32 PCM from WebRTC (48kHz)
+	audioOutCh     chan []float32                // Processed audio chunks for Modal (24kHz)
 	broadcast      func(text string, final bool) // Callback to broadcast transcript to room participants
-	pendingText    string                       // Accumulated tokens for current utterance
-	lastBroadcast  time.Time                    // Last time a non-final broadcast was sent
-	broadcastDirty bool                         // Whether there's unsent accumulated text
-	mu           sync.Mutex
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
+	pendingText    string                        // Accumulated tokens for current utterance
+	lastBroadcast  time.Time                     // Last time a non-final broadcast was sent
+	broadcastDirty bool                          // Whether there's unsent accumulated text
+	mu             sync.Mutex
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
 }
 
 // Room manages transcription for a single Nextcloud Talk room
@@ -47,23 +47,23 @@ type Room struct {
 	LanguageID   string
 	HPBClient    *hpb.Client
 	WebRTCMgr    *webrtc.Manager
-	Speakers     map[string]*Speaker  // HPB sessionID -> Speaker
+	Speakers     map[string]*Speaker      // HPB sessionID -> Speaker
 	ModalClients map[string]*modal.Client // HPB sessionID -> Modal client
-	modalConfig  modal.Config // Modal client configuration
+	modalConfig  modal.Config             // Modal client configuration
 	// internalSessions tracks HPB session IDs that belong to this bot
 	// (identified via "internal":true in participants updates).
 	// Used to avoid adding our own sessions as speakers after HPB reconnects.
 	internalSessions map[string]bool
-	mu           sync.RWMutex
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	logger       *slog.Logger
+	mu               sync.RWMutex
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	logger           *slog.Logger
 }
 
 // Manager manages multiple rooms
 type Manager struct {
-	rooms              map[string]*Room  // roomToken -> Room
+	rooms              map[string]*Room // roomToken -> Room
 	mu                 sync.RWMutex
 	logger             *slog.Logger
 	hpbURL             string
@@ -80,6 +80,7 @@ type ManagerConfig struct {
 	HPBSecret          string // Internal client secret (for WebSocket auth)
 	HPBSignalingSecret string // Backend signaling secret (for HTTP API auth)
 	HPBBackendURL      string // Nextcloud backend URL for HPB auth
+	STTStreamURL       string // Optional explicit STT WebSocket URL
 	ModalWorkspace     string
 	ModalKey           string
 	ModalSecret        string
@@ -106,6 +107,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		hpbBackendURL:      cfg.HPBBackendURL,
 		maxSpeakers:        cfg.MaxSpeakers,
 		modalConfig: modal.Config{
+			StreamURL: cfg.STTStreamURL,
 			Workspace: cfg.ModalWorkspace,
 			Key:       cfg.ModalKey,
 			Secret:    cfg.ModalSecret,
@@ -566,6 +568,7 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 
 	// Create Modal client with proper configuration
 	modalClient := modal.NewClient(modal.Config{
+		StreamURL: r.modalConfig.StreamURL,
 		Workspace: r.modalConfig.Workspace,
 		Key:       r.modalConfig.Key,
 		Secret:    r.modalConfig.Secret,
@@ -593,8 +596,8 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 		audioCache:   audio.NewChunkBuffer(24000, 80, r.logger), // 80ms chunks to match Modal Rust server expectations
 		modalClient:  modalClient,
 		audioPipe:    audioPipe,
-		audioInputCh: make(chan []float32, 500),   // Bounded: ~10s of audio frames
-		audioOutCh:   make(chan []float32, 200),   // Bounded: ~16s of 80ms chunks
+		audioInputCh: make(chan []float32, 500), // Bounded: ~10s of audio frames
+		audioOutCh:   make(chan []float32, 200), // Bounded: ~16s of 80ms chunks
 		broadcast: func(text string, final bool) {
 			// Broadcast transcript to all room participants via HPB backend API.
 			// This sends an HTTP POST to the signaling server which broadcasts
