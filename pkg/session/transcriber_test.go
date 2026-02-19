@@ -299,3 +299,53 @@ func TestFlushPendingBroadcast_UsesBoundedPartial(t *testing.T) {
 		t.Fatalf("flush broadcast mismatch with currentPartialText")
 	}
 }
+
+func TestFlushPendingFinal_SendsFinalAndClearsState(t *testing.T) {
+	var broadcasts []struct {
+		text  string
+		final bool
+	}
+
+	tr := testTranscriber(func(text string, final bool) {
+		broadcasts = append(broadcasts, struct {
+			text  string
+			final bool
+		}{text, final})
+	})
+	logger := slog.Default()
+
+	tr.pendingText = "the little differences"
+	tr.broadcastDirty = true
+
+	tr.flushPendingFinal(logger)
+
+	if len(broadcasts) != 1 {
+		t.Fatalf("expected 1 broadcast, got %d", len(broadcasts))
+	}
+	if broadcasts[0].text != "the little differences" {
+		t.Fatalf("unexpected text: %q", broadcasts[0].text)
+	}
+	if !broadcasts[0].final {
+		t.Fatalf("expected final=true")
+	}
+	if tr.pendingText != "" {
+		t.Fatalf("pendingText should be cleared, got %q", tr.pendingText)
+	}
+	if tr.broadcastDirty {
+		t.Fatalf("broadcastDirty should be false after flushPendingFinal")
+	}
+}
+
+func TestFlushPendingFinal_NoPendingNoBroadcast(t *testing.T) {
+	called := false
+	tr := testTranscriber(func(text string, final bool) {
+		called = true
+	})
+	logger := slog.Default()
+
+	tr.flushPendingFinal(logger)
+
+	if called {
+		t.Fatalf("unexpected broadcast call with empty pending text")
+	}
+}

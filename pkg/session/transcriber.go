@@ -45,6 +45,7 @@ func (t *Transcriber) run(hpbClient *hpb.Client, roomToken string, logger *slog.
 	for {
 		select {
 		case <-t.ctx.Done():
+			t.flushPendingFinal(logger)
 			logger.Debug("transcriber shutting down", "sessionID", t.sessionID)
 			return
 
@@ -65,6 +66,7 @@ func (t *Transcriber) run(hpbClient *hpb.Client, roomToken string, logger *slog.
 			// audio was being sent). Reconnecting would just create another idle
 			// connection that gets closed again, wasting resources.
 			if modal.IsNormalClose(err) {
+				t.flushPendingFinal(logger)
 				logger.Info("Modal connection closed normally (idle timeout), not reconnecting", "sessionID", t.sessionID)
 				continue
 			}
@@ -230,6 +232,21 @@ func (t *Transcriber) flushPendingBroadcast(logger *slog.Logger) {
 		t.lastBroadcast = time.Now()
 		t.broadcastDirty = false
 	}
+}
+
+// flushPendingFinal emits any pending transcript as a final segment.
+// This is used on shutdown/stream close to avoid dropping trailing words
+// when no explicit vad_end marker arrives.
+func (t *Transcriber) flushPendingFinal(logger *slog.Logger) {
+	if t.pendingText == "" || t.broadcast == nil {
+		return
+	}
+
+	logger.Info("flushing pending transcript on shutdown", "sessionID", t.sessionID, "chars", len(t.pendingText))
+	t.broadcast(t.pendingText, true)
+	t.lastBroadcast = time.Now()
+	t.pendingText = ""
+	t.broadcastDirty = false
 }
 
 // currentPartialText returns the bounded non-final text to broadcast.
