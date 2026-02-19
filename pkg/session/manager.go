@@ -597,7 +597,7 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 			// Broadcast transcript to all room participants via HPB backend API.
 			// This sends an HTTP POST to the signaling server which broadcasts
 			// the message as a room event to all connected clients.
-			r.logger.Info("broadcasting transcript", "text", text, "speakerSessionID", sessionID, "room", r.RoomToken)
+			r.logger.Info("broadcasting transcript", "chars", len(text), "final", final, "speakerSessionID", sessionID, "room", r.RoomToken)
 			if err := r.HPBClient.SendTranscriptViaBackend(r.RoomToken, text, langID, sessionID, final); err != nil {
 				r.logger.Error("failed to broadcast transcript via backend API", "error", err)
 			}

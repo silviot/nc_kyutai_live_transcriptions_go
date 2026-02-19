@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/silviot/nc_kyutai_live_transcriptions_go/pkg/hpb"
 	"github.com/silviot/nc_kyutai_live_transcriptions_go/pkg/modal"
@@ -171,21 +173,24 @@ func (t *Transcriber) processAudioLoop(logger *slog.Logger) {
 	}
 }
 
-// broadcastMinInterval is the minimum time between non-final broadcast sends
-// per speaker to avoid overwhelming the signaling server's rate limits.
-// With multiple speakers, the effective total rate is N * (1/interval).
-const broadcastMinInterval = 2 * time.Second
+// broadcastMinInterval is the minimum time between non-final broadcast sends.
+// Keep this low enough for near realtime captions while still rate-limiting.
+const broadcastMinInterval = 350 * time.Millisecond
+
+// maxPartialBroadcastChars bounds non-final transcript payload size.
+// Some clients struggle to continuously update very large partial strings.
+const maxPartialBroadcastChars = 320
 
 // handleTranscript processes a transcript from Modal and sends to HPB.
 // Tokens are accumulated into a buffer and sent as the growing utterance text.
-// On vad_end (Final=true), the accumulated text is sent with final=true and
+// On vad_end (Final=true), the full accumulated text is sent with final=true and
 // the buffer is reset for the next utterance.
-// Non-final broadcasts are throttled to at most one per broadcastMinInterval.
+// Non-final broadcasts are throttled and bounded in size for client stability.
 func (t *Transcriber) handleTranscript(hpbClient *hpb.Client, roomToken string, transcript modal.Transcript, logger *slog.Logger) {
 	if transcript.Final {
 		// VAD end: finalize the current utterance
 		if t.pendingText != "" {
-			logger.Info("transcript finalized", "sessionID", t.sessionID, "text", t.pendingText)
+			logger.Info("transcript finalized", "sessionID", t.sessionID, "chars", len(t.pendingText))
 			if t.broadcast != nil {
 				t.broadcast(t.pendingText, true)
 				t.lastBroadcast = time.Now()
@@ -204,12 +209,12 @@ func (t *Transcriber) handleTranscript(hpbClient *hpb.Client, roomToken string, 
 	t.pendingText += transcript.Text
 	t.broadcastDirty = true
 
-	logger.Info("transcript token", "sessionID", t.sessionID, "token", transcript.Text, "accumulated", t.pendingText)
+	logger.Debug("transcript token", "sessionID", t.sessionID, "token", transcript.Text, "pendingChars", len(t.pendingText))
 
 	if t.broadcast != nil {
 		now := time.Now()
 		if now.Sub(t.lastBroadcast) >= broadcastMinInterval {
-			t.broadcast(t.pendingText, false)
+			t.broadcast(t.currentPartialText(), false)
 			t.lastBroadcast = now
 			t.broadcastDirty = false
 		}
@@ -221,10 +226,25 @@ func (t *Transcriber) handleTranscript(hpbClient *hpb.Client, roomToken string, 
 // left unsent when tokens arrive slower than the throttle interval.
 func (t *Transcriber) flushPendingBroadcast(logger *slog.Logger) {
 	if t.broadcastDirty && t.broadcast != nil && t.pendingText != "" {
-		t.broadcast(t.pendingText, false)
+		t.broadcast(t.currentPartialText(), false)
 		t.lastBroadcast = time.Now()
 		t.broadcastDirty = false
 	}
+}
+
+// currentPartialText returns the bounded non-final text to broadcast.
+// Keep the most recent tail when pending text grows too large.
+func (t *Transcriber) currentPartialText() string {
+	if len(t.pendingText) <= maxPartialBroadcastChars {
+		return t.pendingText
+	}
+
+	start := len(t.pendingText) - maxPartialBroadcastChars
+	for start < len(t.pendingText) && !utf8.RuneStart(t.pendingText[start]) {
+		start++
+	}
+	tail := strings.TrimLeft(t.pendingText[start:], " ")
+	return "..." + tail
 }
 
 // AddAudioFrame adds a decoded float32 PCM frame to the processing queue

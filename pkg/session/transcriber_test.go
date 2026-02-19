@@ -2,6 +2,7 @@ package session
 
 import (
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -258,5 +259,43 @@ func TestFlushPendingBroadcast(t *testing.T) {
 	}
 	if tr.broadcastDirty {
 		t.Error("broadcastDirty should be false after flush")
+	}
+}
+
+func TestCurrentPartialText_TruncatesLongPending(t *testing.T) {
+	tr := testTranscriber(nil)
+
+	long := strings.Repeat("x", maxPartialBroadcastChars+50)
+	tr.pendingText = long
+
+	got := tr.currentPartialText()
+	want := "..." + long[len(long)-maxPartialBroadcastChars:]
+
+	if got != want {
+		t.Errorf("currentPartialText() length=%d, want length=%d", len(got), len(want))
+	}
+}
+
+func TestFlushPendingBroadcast_UsesBoundedPartial(t *testing.T) {
+	var broadcasts []string
+
+	tr := testTranscriber(func(text string, final bool) {
+		broadcasts = append(broadcasts, text)
+	})
+	logger := slog.Default()
+
+	tr.pendingText = strings.Repeat("y", maxPartialBroadcastChars+20)
+	tr.broadcastDirty = true
+
+	tr.flushPendingBroadcast(logger)
+
+	if len(broadcasts) != 1 {
+		t.Fatalf("expected 1 broadcast, got %d", len(broadcasts))
+	}
+	if len(broadcasts[0]) > maxPartialBroadcastChars+3 {
+		t.Fatalf("broadcast too long: len=%d", len(broadcasts[0]))
+	}
+	if broadcasts[0] != tr.currentPartialText() {
+		t.Fatalf("flush broadcast mismatch with currentPartialText")
 	}
 }
