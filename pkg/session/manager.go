@@ -586,13 +586,16 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 
 	langID := r.LanguageID
 	transcriber := &Transcriber{
-		sessionID:    sessionID,
-		peerConn:     peerConn,
-		audioCache:   audio.NewChunkBuffer(24000, 80, r.logger), // 80ms chunks to match Modal Rust server expectations
-		modalClient:  modalClient,
-		audioPipe:    audioPipe,
-		audioInputCh: make(chan []float32, 500), // Bounded: ~10s of audio frames
-		audioOutCh:   make(chan []float32, 200), // Bounded: ~16s of 80ms chunks
+		sessionID:   sessionID,
+		peerConn:    peerConn,
+		audioCache:  audio.NewChunkBuffer(24000, 80, r.logger), // 80ms chunks to match Modal Rust server expectations
+		modalClient: modalClient,
+		audioPipe:   audioPipe,
+		// Keep buffers shallow to prefer realtime behavior over stale backlog.
+		// If upstream/outbound falls behind, we drop old audio instead of
+		// delivering delayed transcripts seconds later.
+		audioInputCh: make(chan []float32, 120), // ~2.4s at ~20ms input frames
+		audioOutCh:   make(chan []float32, 25),  // ~2.0s of 80ms chunks
 		broadcast: func(text string, final bool) {
 			// Broadcast transcript to all room participants via HPB backend API.
 			// This sends an HTTP POST to the signaling server which broadcasts

@@ -43,7 +43,7 @@ func TestHandleTranscript_TokenAccumulation(t *testing.T) {
 	}
 
 	// First token broadcasts immediately (lastBroadcast is zero),
-	// subsequent tokens within 2s are throttled
+	// subsequent rapid tokens are throttled
 	if len(broadcasts) != 1 {
 		t.Fatalf("expected 1 broadcast (first token, rest throttled), got %d", len(broadcasts))
 	}
@@ -214,7 +214,7 @@ func TestHandleTranscript_ThrottlingBehavior(t *testing.T) {
 		t.Fatalf("first token should broadcast immediately, got %d broadcasts", len(broadcasts))
 	}
 
-	// Rapid tokens: throttled (within 2s window)
+	// Rapid tokens: throttled (within current broadcast window)
 	tr.handleTranscript(nil, "room1", modal.Transcript{Type: "token", Text: " B"}, logger)
 	tr.handleTranscript(nil, "room1", modal.Transcript{Type: "token", Text: " C"}, logger)
 	if len(broadcasts) != 1 {

@@ -175,7 +175,7 @@ func (t *Transcriber) processAudioLoop(logger *slog.Logger) {
 
 // broadcastMinInterval is the minimum time between non-final broadcast sends.
 // Keep this low enough for near realtime captions while still rate-limiting.
-const broadcastMinInterval = 350 * time.Millisecond
+const broadcastMinInterval = 120 * time.Millisecond
 
 // maxPartialBroadcastChars bounds non-final transcript payload size.
 // Some clients struggle to continuously update very large partial strings.
