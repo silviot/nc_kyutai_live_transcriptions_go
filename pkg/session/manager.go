@@ -585,11 +585,6 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 	}
 
 	langID := r.LanguageID
-	// Use the bot's own HPB session ID as speakerSessionId so that every
-	// browser (including the actual speaker's) has a matching CallParticipantModel
-	// and can display the transcript. Using the real speaker's ID would cause
-	// the speaker's own browser to drop the transcript (no model for self).
-	botSessionID := r.HPBClient.SessionID()
 	transcriber := &Transcriber{
 		sessionID:    sessionID,
 		peerConn:     peerConn,
@@ -602,8 +597,8 @@ func (r *Room) addSpeaker(sessionID, userID, name string) error {
 			// Broadcast transcript to all room participants via HPB backend API.
 			// This sends an HTTP POST to the signaling server which broadcasts
 			// the message as a room event to all connected clients.
-			r.logger.Info("broadcasting transcript", "text", text, "speaker", sessionID, "bot", botSessionID, "room", r.RoomToken)
-			if err := r.HPBClient.SendTranscriptViaBackend(r.RoomToken, text, langID, botSessionID, final); err != nil {
+			r.logger.Info("broadcasting transcript", "text", text, "speakerSessionID", sessionID, "room", r.RoomToken)
+			if err := r.HPBClient.SendTranscriptViaBackend(r.RoomToken, text, langID, sessionID, final); err != nil {
 				r.logger.Error("failed to broadcast transcript via backend API", "error", err)
 			}
 		},
