@@ -231,7 +231,7 @@ func TestHandleParticipantsEvent_StaleParticipantRemovedIfExisting(t *testing.T)
 	}
 
 	// Now participants update arrives with stale ping
-	stalePing := float64(time.Now().Add(-5 * time.Minute).Unix())
+	stalePing := float64(time.Now().Add(-(stalePingThreshold + time.Minute)).Unix())
 
 	msg := &hpb.EventMessage{
 		Type: "event",
@@ -259,6 +259,47 @@ func TestHandleParticipantsEvent_StaleParticipantRemovedIfExisting(t *testing.T)
 	// Ghost speaker should be removed
 	if _, exists := room.Speakers["ghost-hpb-id"]; exists {
 		t.Error("stale participant should be removed as speaker")
+	}
+}
+
+func TestHandleParticipantsEvent_RecentPingParticipantKeptIfExisting(t *testing.T) {
+	room := newTestRoom("")
+
+	// Pre-add ghost as speaker (already active)
+	room.Speakers["ghost-hpb-id"] = &Speaker{
+		SessionID:   "ghost-hpb-id",
+		Transcriber: nil,
+	}
+
+	// lastPing is recent enough to be considered active
+	recentPing := float64(time.Now().Add(-(stalePingThreshold - time.Minute)).Unix())
+
+	msg := &hpb.EventMessage{
+		Type: "event",
+		Event: hpb.EventInner{
+			Target: "participants",
+			Type:   "update",
+			Update: &hpb.RoomEventUpdate{
+				Users: []map[string]interface{}{
+					{
+						"sessionId": "ghost-hpb-id",
+						"inCall":    float64(7),
+						"lastPing":  recentPing,
+						"userId":    "ghost-user",
+					},
+				},
+			},
+		},
+	}
+
+	room.handleParticipantsEvent(msg)
+
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+
+	// Speaker should still be present (not stale)
+	if _, exists := room.Speakers["ghost-hpb-id"]; !exists {
+		t.Error("recent participant should not be removed as stale")
 	}
 }
 
@@ -375,7 +416,7 @@ func TestReconnectCycleSimulation(t *testing.T) {
 			Join: []hpb.EventSessionEntry{
 				{SessionID: "bot-v2"},           // New session (current)
 				{SessionID: "bot-v1"},           // Old session (stale)
-				{SessionID: "real-participant"},  // Real user
+				{SessionID: "real-participant"}, // Real user
 			},
 		},
 	}
